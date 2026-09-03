@@ -370,6 +370,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             self.in_proj_padding = -local_output_size % 16
             if self.in_proj_padding:
+                # Keep padding after the checkpoint-backed shards so their
+                # merged-column offsets stay unchanged at every TP size.
                 in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
         else:
             in_proj_output_sizes = [self.projection_size] * 3 + [

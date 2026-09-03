@@ -4,6 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 
@@ -606,7 +607,7 @@ def is_layer_skipped(
     ignored_layers: list[str],
     fused_mapping: Mapping[str, list[str]] = MappingProxyType({}),
     *,
-    match_mode: Literal["exact", "substring", "suffix"] = "exact",
+    match_mode: Literal["exact", "substring", "suffix", "fnmatch"] = "exact",
 ) -> bool:
     def prefix_full_match(prefix: str, ignored_layers: list[str]) -> bool:
         return prefix in ignored_layers
@@ -623,12 +624,17 @@ def is_layer_skipped(
             prefix == layer or prefix.endswith(f".{layer}") for layer in ignored_layers
         )
 
+    def fnmatch_match(prefix: str, ignored_layers: list[str]) -> bool:
+        return any(fnmatch(prefix, pattern) for pattern in ignored_layers)
+
     if match_mode == "exact":
         match_func = prefix_full_match
     elif match_mode == "substring":
         match_func = substr_match
     elif match_mode == "suffix":
         match_func = suffix_match
+    elif match_mode == "fnmatch":
+        match_func = fnmatch_match
     else:
         raise ValueError(f"Unsupported layer skip match mode: {match_mode}")
 

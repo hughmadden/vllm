@@ -208,6 +208,33 @@ def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+def test_modelopt_nvfp4_leaves_wildcard_excluded_fused_projection_unquantized():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[
+            "*.self_attn.q_proj",
+            "*.self_attn.k_proj",
+            "*.self_attn.v_proj",
+            "*.self_attn.b_proj",
+            "*.self_attn.f_a_proj",
+        ],
+    )
+    config.packed_modules_mapping = {
+        "in_proj_qkvgfab": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+        ]
+    }
+
+    assert config.is_layer_excluded(
+        "model.language_model.layers.0.self_attn.in_proj_qkvgfab"
+    )
+
+
 def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
     config = _mixed_precision_config(
         {"lm_head": {"quant_algo": "NVFP4", "group_size": 16}}

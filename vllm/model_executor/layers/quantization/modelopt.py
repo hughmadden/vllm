@@ -147,8 +147,13 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if len(self.exclude_modules) == 0:
             return False
 
-        # First check exact matching with fused layer support
-        if is_layer_skipped(prefix, self.exclude_modules, self.packed_modules_mapping):
+        # First check wildcard matching with fused layer support.
+        if is_layer_skipped(
+            prefix,
+            self.exclude_modules,
+            self.packed_modules_mapping,
+            match_mode="fnmatch",
+        ):
             return True
 
         # TODO: This special hard coded logic is not needed for quantized checkpoints
