@@ -436,6 +436,12 @@ class RequestOffloadState:
     ) -> int:
         """Number of allocated and keyed leading chunks eligible for store.
 
+        Groups whose spec is not prefix-cacheable (e.g. KpoolTailSpec, the
+        indexer's one-block rolling scratch: ``prefix_cacheable=False``)
+        store nothing: their content is a circular buffer valid only at
+        the instant it was written, so a disk copy can never serve a
+        later-boundary resume (0008).
+
         For eagle/MTP groups the volatile trailing chunk of the offloadable
         range is excluded while decoding: the draft-layer KV of the last
         accepted position may be rewritten after spec-token rejection. During
@@ -450,6 +456,8 @@ class RequestOffloadState:
         and a permanent hole breaks prefix-reuse lookup. ``is_finished`` is
         monotonic, so the finish-time calls all see the lifted exclusion.
         """
+        if not getattr(group_config.kv_cache_spec, "prefix_cacheable", True):
+            return 0
         # At finish the final partial chunk is stable and must count:
         # a same-prompt repeat resumes at the full-prompt boundary, and
         # with the floor the whole store frontier stops one chunk short
@@ -572,6 +580,13 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if not getattr(group_config.kv_cache_spec, "prefix_cacheable", True):
+                # Rolling scratch (KpoolTailSpec) cannot serve a prefix
+                # boundary; excluding it here removes it from every lookup
+                # scan, so it can neither clamp max_hit nor veto the
+                # request (0008). Its state is scratch: the indexer
+                # rebuilds it, exactly as on a local prefix-cache hit.
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -1099,6 +1114,18 @@ class OffloadingConnectorScheduler:
             req_status.group_states,
             blocks.blocks,
         ):
+            if not getattr(group_config.kv_cache_spec, "prefix_cacheable", True):
+                # Rolling scratch is never loaded from disk (0008): it is
+                # not prefix-cacheable, was never stored, and mirrors the
+                # local prefix-cache-hit behavior (fresh scratch blocks,
+                # indexer rebuilds. Skipped before any per-group
+                # arithmetic -- its physical block count (one circular
+                # scratch block) can never satisfy prefix-chunk math --
+                # but KEPT in the spec with zero blocks: the worker
+                # validates that group_sizes covers every geometry group.
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
@@ -1126,6 +1153,7 @@ class OffloadingConnectorScheduler:
 
             assert num_locally_computed_tokens % tokens_per_block == 0
             num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
+
 
             if group_config.sliding_window_size_in_chunks is not None:
                 assert (
@@ -1621,6 +1649,11 @@ class OffloadingConnectorScheduler:
                     and self.config.retention_interval is None
                     and final_swa_alignment_blocks is not None
                 )
+                if not getattr(group_config.kv_cache_spec, "prefix_cacheable", True):
+                    # Rolling scratch stores nothing (0008); the (0, 0)
+                    # range keeps group_store_ranges index-aligned.
+                    group_store_ranges.append((0, 0))
+                    continue
                 if (
                     self.config.retention_interval is not None
                     or group_config.is_eagle_group
