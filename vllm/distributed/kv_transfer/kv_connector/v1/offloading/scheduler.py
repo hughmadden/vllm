@@ -589,6 +589,14 @@ class OffloadingConnectorScheduler:
         self._eviction_release_watermark = int(
             extra_cfg.get("eviction_release_watermark", 8192)
         )
+        # 0011 pressure gate: when set, the sink declines new holds while
+        # the free queue is ABOVE this watermark -- an idle, un-pressured
+        # pool writes nothing to disk. Copies exist only because decode
+        # needs the memory back. None/0 = off (0010 behaviour).
+        self._eviction_store_high_watermark = int(
+            extra_cfg.get("eviction_store_high_watermark", 0)
+        )
+        self._eviction_pressure_skips = 0
         self._eviction_store_per_step = int(
             extra_cfg.get("eviction_store_per_step", 8)
         )
@@ -1620,6 +1628,14 @@ class OffloadingConnectorScheduler:
             held = len(self._held_evictions)
             if free_blocks < self._eviction_release_watermark + held:
                 self._eviction_skips += 1
+                return False
+            # 0011 pressure gate: with the pool nowhere near full there is
+            # no eviction pressure to absorb -- decline the hold so an
+            # idle engine writes nothing. Stale-content durability is the
+            # idle-time flusher's job (0012), not the eviction sink's.
+            high = getattr(self, "_eviction_store_high_watermark", 0)
+            if high and free_blocks > high - held:
+                self._eviction_pressure_skips += 1
                 return False
         self._held_evictions[block.block_id] = (
             make_offload_key(block_hash, group_idx),
