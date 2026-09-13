@@ -1381,231 +1381,6 @@ class OffloadingConnectorScheduler:
                 )
         return store_jobs
 
-    def _build_partial_tail_store_jobs(
-        self, scheduler_output: SchedulerOutput
-    ) -> dict[int, TransferJob]:
-        block_state = scheduler_output.kv_connector_block_state
-        handoffs = block_state.boundary_state_offloads if block_state else None
-        if not handoffs:
-            return {}
-
-        store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
-        if not self.config.supports_partial_tail:
-            return store_jobs
-
-        for req_id, entries in handoffs.items():
-            entries = [
-                entry
-                for entry in entries
-                if entry[2] % self._partial_tail_block_size != 0
-            ]
-            if not entries:
-                continue
-            req_status = self._req_status.get(req_id)
-            assert req_status is not None
-            boundaries = {boundary for _, _, boundary in entries}
-            assert len(boundaries) == 1
-            boundary = boundaries.pop()
-            req = req_status.req
-            max_boundary = min(
-                req.num_prompt_tokens,
-                req_status.max_offload_tokens or req.num_prompt_tokens,
-            )
-            assert boundary > 0
-            assert boundary % self.config.tokens_per_hash == 0
-            assert boundary <= max_boundary
-
-            cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
-            assert self._cow_source_groups.issubset(cow_blocks)
-
-            assert boundary % self._partial_tail_block_size != 0
-            block_idx = boundary // self._partial_tail_block_size
-            if any(
-                group.group_idx not in self._cow_source_groups
-                and block_idx >= len(req_status.group_states[group.group_idx].block_ids)
-                for group in self.config.kv_group_configs
-            ):
-                continue
-            keys = [
-                self._make_boundary_key(req, group.group_idx, boundary)
-                for group in self.config.kv_group_configs
-            ]
-            block_ids = [
-                cow_blocks[group.group_idx]
-                if group.group_idx in self._cow_source_groups
-                else req_status.group_states[group.group_idx].block_ids[block_idx]
-                for group in self.config.kv_group_configs
-            ]
-            assert all(block_id != 0 for block_id in block_ids)
-
-            store_output = self.manager.prepare_store(keys, req_status.req_context)
-            if store_output is None:
-                self._connector_stats.increase_counter(
-                    _ConnectorMetricName.ALLOCATION_FAILURE
-                )
-                continue
-            if not store_output.keys_to_store:
-                continue
-
-            for group_config, key in zip(self.config.kv_group_configs, keys):
-                if key in store_output.keys_to_store:
-                    self._events_tracker.record_partial_store(
-                        req, group_config, boundary, key
-                    )
-
-            group_by_key = {key: idx for idx, key in enumerate(keys)}
-            accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
-            group_sizes = [0] * len(self.config.kv_group_configs)
-            block_indices = [0] * len(self.config.kv_group_configs)
-            for group_idx in accepted_groups:
-                group_sizes[group_idx] = 1
-                block_indices[group_idx] = block_idx
-            source_blocks = [block_ids[group_idx] for group_idx in accepted_groups]
-
-            job_id = self._generate_job_id()
-            req_status.transfer_jobs.add(job_id)
-            for block_id in source_blocks:
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
-            self._jobs[job_id] = TransferJobStatus(
-                req_id=req_id,
-                pending_count=self.config.num_workers,
-                keys=set(store_output.keys_to_store),
-                is_store=True,
-                fenced_block_ids=source_blocks,
-            )
-            store_jobs[job_id] = TransferJob(
-                req_id=req_id,
-                src_spec=GPULoadStoreSpec(
-                    source_blocks,
-                    group_sizes=group_sizes,
-                    block_indices=block_indices,
-                ),
-                dst_spec=store_output.store_spec,
-            )
-
-        return store_jobs
-
-    def _reachable_store_block_mask(
-        self,
-        group_config: GroupOffloadConfig,
-        start_chunk_idx: int,
-        end_chunk_idx: int,
-        final_segment_end_chunk_idx: int | None,
-        reachable_boundaries: tuple[int, ...],
-    ) -> list[bool] | None:
-        """Build the block mask for a range of candidate offload chunks."""
-        blocks_per_chunk = self.config.blocks_per_chunk
-        return group_config.manager_cls.reachable_block_mask(
-            start_block=start_chunk_idx * blocks_per_chunk,
-            end_block=end_chunk_idx * blocks_per_chunk,
-            alignment_tokens=self.config.alignment_tokens,
-            kv_cache_spec=group_config.kv_cache_spec,
-            use_eagle=group_config.is_eagle_group,
-            retention_interval=self.config.retention_interval,
-            reachable_boundaries=reachable_boundaries,
-            dcp_world_size=self.config.dcp_world_size,
-            final_segment_end_block=(
-                final_segment_end_chunk_idx * blocks_per_chunk
-                if final_segment_end_chunk_idx is not None
-                else None
-            ),
-        )
-
-    def _final_swa_alignment_blocks(
-        self, group_config: GroupOffloadConfig
-    ) -> int | None:
-        """Return representable final-tail alignment for a non-EAGLE SWA group."""
-        alignment_tokens = self.config.alignment_tokens
-        if (
-            alignment_tokens is None
-            or group_config.is_eagle_group
-            or not isinstance(group_config.kv_cache_spec, SlidingWindowSpec)
-            or alignment_tokens % group_config.tokens_per_block != 0
-        ):
-            return None
-        return alignment_tokens // group_config.tokens_per_block
-
-    def _advance_store_frontiers(
-        self,
-        req_status: RequestOffloadState,
-        num_offloadable_tokens: int,
-        pending: set[OffloadKey],
-        accepted: set[OffloadKey],
-    ) -> None:
-        """Advance through stable keys; never seal pending ones.
-
-        ``storable_chunks`` supplies the same per-group upper bound that
-        ``advance_stored_idx`` uses, so the EAGLE/MTP volatile tail is excluded
-        here too. The walk stops at the first PENDING key: one the manager
-        declined (retryable pressure) or an unmaterialized EAGLE row while the
-        request is running (draft KV lands a step later). Both become
-        storeable on a later pass and must be re-offered, not jumped over --
-        jumping sealed every chunk past the first offered slice of each
-        request (the tier then held ~5 objects/session and the lookup hit
-        boundary never advanced). Permanently filtered keys (reachability
-        masks, recycled/null rows outside the pending classification, rows
-        still null at request finish) advance normally: re-offering them is
-        futile and would hold the finished-request drain open forever.
-        """
-        for config, state in zip(self.config.kv_group_configs, req_status.group_states):
-            end = req_status.storable_chunks(config, state, num_offloadable_tokens)
-            frontier = state.next_stored_chunk_idx
-            for idx in range(frontier, end):
-                key = state.offload_keys[idx]
-                if key in pending and key not in accepted:
-                    break
-                frontier = idx + 1
-            state.next_stored_chunk_idx = frontier
-
-    def _has_finished_store_frontier(self, status: RequestOffloadState) -> bool:
-        """Whether a held finished request still owes eligible stable keys.
-
-        ``storable_chunks`` supplies the per-group bound; ``is_finished`` is
-        already True here, so the EAGLE/MTP tail exclusion is lifted and the
-        final chunk counts. A permanently disabled store abandons the unsaved
-        tail honestly rather than acknowledging or fabricating it.
-        """
-        if not status.finish_pending or status.finish_store_abandoned:
-            return False
-        for config, state in zip(self.config.kv_group_configs, status.group_states):
-            end = status.storable_chunks(config, state, status.finish_store_tokens)
-            if state.next_stored_chunk_idx < end:
-                if not self.manager.can_store():
-                    status.finish_store_abandoned = True
-                    logger.warning(
-                        "Request %s: incomplete store frontier abandoned: "
-                        "storage disabled",
-                        status.req.request_id,
-                    )
-                    return False
-                # Liveness bound: a frontier that STOPS PROGRESSING (persistent
-                # manager declines, rows that stay null past finish) must not
-                # hold the core request -- or the client response, which core
-                # gates on the terminal finished_sending signal -- forever.
-                # Steps that advance any group's frontier reset the stall
-                # counter, so slow-but-progressing drains are never cut.
-                frontier_now = sum(
-                    state.next_stored_chunk_idx for state in status.group_states
-                )
-                if frontier_now > getattr(status, "finish_drain_frontier", 0):
-                    status.finish_drain_frontier = frontier_now
-                    status.finish_drain_stall = 0
-                    return True
-                stall = getattr(status, "finish_drain_stall", 0) + 1
-                status.finish_drain_stall = stall
-                # getattr: the bound is a class constant, but extracted
-                # method tests bind onto a plain namespace.
-                if stall > getattr(self, "_FINISH_DRAIN_STEP_BOUND", 64):
-                    status.finish_store_abandoned = True
-                    logger.warning(
-                        "Request %s: incomplete store frontier abandoned: "
-                        "drain stalled without progress",
-                        status.req.request_id,
-                    )
-                    return False
-                return True
-        return False
-
     def bind_block_pool(self, block_pool) -> None:
         # 0009: install the write-behind eviction sink. The sink declines
         # unless evict-only mode is active, so binding is harmless in
@@ -1622,8 +1397,7 @@ class OffloadingConnectorScheduler:
         Holding is credit-bounded; overflow frees unstored and counts the
         skip -- the tier degrades to less coverage, never to stalls.
         """
-        if not getattr(self, "_evict_only", False):
-            return False
+        # 0013: evict-only is the only mode; the sink is always armed.
         raw_hash = block.block_hash
         if raw_hash is None:
             return False
@@ -1851,337 +1625,13 @@ class OffloadingConnectorScheduler:
         # 0009 evict-only: no eager offers, ever (R1 -- zero BAU tax by
         # construction). The only stores are eviction copies, drained
         # below at background priority.
-        if getattr(self, "_evict_only", False):
-            jobs = self._drain_eviction_queue()
-            jobs.update(self._scan_idle_flush(scheduler_output))
-            return jobs
-        blocks_per_chunk = self.config.blocks_per_chunk
-        store_jobs: dict[int, TransferJob] = {}
-        # Drain held finished requests first, even on no-forward/idle steps.
-        # Otherwise a shared admission quantum can starve their GPU ownership.
-        requests = dict.fromkeys(
-            rid for rid, status in self._req_status.items() if status.finish_pending
-        )
-        requests.update(
-            dict.fromkeys(
-                chain(
-                    scheduler_output.num_scheduled_tokens,
-                    scheduler_output.finished_req_ids or (),
-                )
-            )
-        )
-        for req_id in requests:
-            req_status = self._req_status.get(req_id)
-            if req_status is None or not self.manager.can_store():
-                continue
-            req = req_status.req
-
-            if req_status.finish_pending:
-                # The token boundary and the GPU table were snapshotted at
-                # request_finished; they cannot move while core holds the rows.
-                if not self._has_finished_store_frontier(req_status):
-                    continue
-                num_offloadable_tokens = req_status.finish_store_tokens
-            else:
-                if req.status is RequestStatus.FINISHED_ABORTED:
-                    num_tokens_after_batch = req.num_computed_tokens
-                elif req.is_finished():
-                    # Clamp to the GPU prefix cache's commit point. The final
-                    # sampled token's slot is never committed (under spec decode
-                    # it holds a rejected draft's KV), so a block ending there
-                    # must not be stored.
-                    num_tokens_after_batch = max(
-                        req.num_prompt_tokens, req.num_tokens - 1
-                    )
-                else:
-                    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                    num_tokens_after_batch = (
-                        req.num_computed_tokens + num_scheduled_tokens
-                    )
-
-                num_offloadable_tokens = self._calc_num_offloadable_tokens(
-                    req_status, num_tokens_after_batch
-                )
-            prompt_offloadable_tokens = self._calc_num_offloadable_tokens(
-                req_status, req.num_prompt_tokens
-            )
-
-            # Filter out chunks skipped due to sliding window attention / SSM
-            # or unreachable by the load path's alignment constraints.
-            new_offload_keys: list[OffloadKey] = []
-            group_store_ranges: list[tuple[int, int]] = []
-            # Candidates that must be re-offered on a later pass, not
-            # jumped over: rows the manager declines (retryable) and
-            # unmaterialized EAGLE rows while the request is running
-            # (draft KV lands a step later). Everything else filtered
-            # (reachability masks, recycled/null rows at finish) is
-            # permanent and advances normally.
-            pending_offload_keys: set[OffloadKey] = set()
-
-            reachable_boundaries: tuple[int, ...] = ()
-            if self.config.retention_interval is not None:
-                reachable_boundaries = (req.num_prompt_tokens - 1,)
-                if req.shared_prefix_boundary:
-                    reachable_boundaries += (req.shared_prefix_boundary,)
-
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
-            ):
-                num_chunks = req_status.storable_chunks(
-                    group_config, group_state, num_offloadable_tokens
-                )
-
-                start_chunk_idx = group_state.next_stored_chunk_idx
-                prompt_horizon_chunks = (
-                    prompt_offloadable_tokens // group_config.tokens_per_chunk
-                )
-                final_swa_alignment_blocks = self._final_swa_alignment_blocks(
-                    group_config
-                )
-                reconsider_final_swa_tail = (
-                    req.is_finished()
-                    and num_chunks != prompt_horizon_chunks
-                    and self.config.retention_interval is None
-                    and final_swa_alignment_blocks is not None
-                )
-                if not getattr(group_config.kv_cache_spec, "prefix_cacheable", True):
-                    # Rolling scratch stores nothing (0008); the (0, 0)
-                    # range keeps group_store_ranges index-aligned.
-                    group_store_ranges.append((0, 0))
-                    continue
-                if (
-                    self.config.retention_interval is not None
-                    or group_config.is_eagle_group
-                ):
-                    store_horizon_chunks = None
-                elif req.is_finished():
-                    store_horizon_chunks = num_chunks
-                elif num_chunks <= prompt_horizon_chunks:
-                    store_horizon_chunks = prompt_horizon_chunks
-                else:
-                    # An active decode frontier is not a final request
-                    # boundary. Only fixed alignment tails are reachable.
-                    store_horizon_chunks = None
-                if reconsider_final_swa_tail:
-                    assert final_swa_alignment_blocks is not None
-                    horizon_blocks = num_chunks * blocks_per_chunk
-                    partial_segment_start_block = (
-                        horizon_blocks - horizon_blocks % final_swa_alignment_blocks
-                    )
-                    partial_segment_start_chunk = (
-                        partial_segment_start_block // blocks_per_chunk
-                    )
-                    start_chunk_idx = min(start_chunk_idx, partial_segment_start_chunk)
-                group_store_ranges.append((start_chunk_idx, num_chunks))
-
-                if group_config.requires_cow_source:
-                    continue
-
-                if num_chunks <= start_chunk_idx:
-                    continue
-                offload_keys = group_state.offload_keys[start_chunk_idx:num_chunks]
-                # For each chunk, take the last corresponding GPU block. For
-                # blocks_per_chunk=3 and GPU block IDs 1 5 6 7 2 4 9 3 8,
-                # this selects GPU blocks 6 4 8.
-                # A block_id of 0 means either a sliding window / SSM skip
-                # or a stale entry that was zeroed out — skip it either way.
-                offload_block_ids = group_state.block_ids[
-                    start_chunk_idx * blocks_per_chunk
-                    + blocks_per_chunk
-                    - 1 : num_chunks * blocks_per_chunk : blocks_per_chunk
-                ]
-                assert len(offload_keys) == len(offload_block_ids)
-
-                # Use reachable_block_mask to filter unreachable chunks
-                # (SWA/Mamba sparsity + retention interval).
-                # reachable_block_mask operates in KV-block coordinates,
-                # so convert chunk indices to block indices.
-                block_mask = self._reachable_store_block_mask(
-                    group_config=group_config,
-                    start_chunk_idx=start_chunk_idx,
-                    end_chunk_idx=num_chunks,
-                    final_segment_end_chunk_idx=store_horizon_chunks,
-                    reachable_boundaries=reachable_boundaries,
-                )
-
-                prompt_horizon_block_mask: list[bool] | None = None
-                if reconsider_final_swa_tail:
-                    prompt_horizon_block_mask = self._reachable_store_block_mask(
-                        group_config=group_config,
-                        start_chunk_idx=start_chunk_idx,
-                        end_chunk_idx=num_chunks,
-                        final_segment_end_chunk_idx=prompt_horizon_chunks,
-                        reachable_boundaries=reachable_boundaries,
-                    )
-
-                for key_idx, (offload_key, block_id) in enumerate(
-                    zip(offload_keys, offload_block_ids)
-                ):
-                    if block_id == 0:
-                        if group_config.is_eagle_group and not req.is_finished():
-                            # Draft KV materializes a step later; re-offer.
-                            pending_offload_keys.add(offload_key)
-                        continue
-                    abs_chunk_idx = start_chunk_idx + key_idx
-                    if (
-                        reconsider_final_swa_tail
-                        and abs_chunk_idx < group_state.next_stored_chunk_idx
-                        and (
-                            prompt_horizon_block_mask is None
-                            or any(
-                                prompt_horizon_block_mask[
-                                    key_idx * blocks_per_chunk + block_idx
-                                ]
-                                for block_idx in range(blocks_per_chunk)
-                            )
-                        )
-                    ):
-                        continue
-                    # A chunk is reachable if any of its constituent
-                    # blocks is reachable.
-                    if block_mask is not None and not any(
-                        block_mask[key_idx * blocks_per_chunk + b]
-                        for b in range(blocks_per_chunk)
-                    ):
-                        continue
-                    new_offload_keys.append(offload_key)
-
-            if not new_offload_keys:
-                self._advance_store_frontiers(
-                    req_status, num_offloadable_tokens,
-                    pending_offload_keys, set()
-                )
-                continue
-
-            store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
-            )
-            if store_output is None:
-                self._connector_stats.increase_counter(
-                    _ConnectorMetricName.ALLOCATION_FAILURE
-                )
-                logger.warning("Request %s: cannot store chunks", req_id)
-                continue
-
-            if not store_output.keys_to_store:
-                accepted = set(store_output.skipped_keys)
-                pending_offload_keys.update(
-                    set(new_offload_keys) - accepted
-                )
-                self._advance_store_frontiers(
-                    req_status,
-                    num_offloadable_tokens,
-                    pending_offload_keys,
-                    accepted,
-                )
-                continue
-
-            self._touch(req_status)
-
-            keys_to_store = set(store_output.keys_to_store)
-
-            group_sizes: list[int] = []
-            block_indices: list[int] = []
-            src_block_ids: list[int] = []
-            fenced_block_ids: list[int] = []
-            deferred_fence_block_ids: list[int] = []
-            for group_config, group_state, store_range in zip(
-                self.config.kv_group_configs,
-                req_status.group_states,
-                group_store_ranges,
-            ):
-                is_sliding_window = (
-                    group_config.sliding_window_size_in_chunks is not None
-                )
-                start_chunk_idx, num_chunks = store_range
-                block_ids = group_state.block_ids
-                num_group_blocks = 0
-                start_gpu_block_idx: int | None = None
-                for idx, offload_key in enumerate(
-                    group_state.offload_keys[start_chunk_idx:num_chunks]
-                ):
-                    if offload_key not in keys_to_store:
-                        continue
-
-                    chunk_idx = start_chunk_idx + idx
-
-                    self._events_tracker.record_store(
-                        req, group_config, chunk_idx, offload_key
-                    )
-
-                    gpu_block_idx = chunk_idx * blocks_per_chunk
-                    for i in range(blocks_per_chunk):
-                        block_id = block_ids[gpu_block_idx + i]
-                        if block_id == 0:
-                            continue
-                        if start_gpu_block_idx is None:
-                            start_gpu_block_idx = gpu_block_idx + i
-                        src_block_ids.append(block_id)
-                        num_group_blocks += 1
-                        if is_sliding_window:
-                            fenced_block_ids.append(block_id)
-                        else:
-                            deferred_fence_block_ids.append(block_id)
-
-                group_sizes.append(num_group_blocks)
-                block_indices.append(start_gpu_block_idx or 0)
-
-            accepted = keys_to_store | set(store_output.skipped_keys)
-            pending_offload_keys.update(
-                set(new_offload_keys) - accepted
-            )
-            self._advance_store_frontiers(
-                req_status,
-                num_offloadable_tokens,
-                pending_offload_keys,
-                accepted,
-            )
-
-            src_spec = GPULoadStoreSpec(
-                src_block_ids, group_sizes=group_sizes, block_indices=block_indices
-            )
-            dst_spec = store_output.store_spec
-
-            job_id = self._generate_job_id()
-            # a store can only be issued when no load is pending.
-            if req_status.transfer_jobs:
-                any_jid = next(iter(req_status.transfer_jobs))
-                assert self._jobs[any_jid].is_store
-            req_status.transfer_jobs.add(job_id)
-
-            # Watch sliding window blocks as they may get evicted
-            # before the request finishes
-            for bid in fenced_block_ids:
-                self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-
-            # Full-attention blocks remain held by core request ownership.
-            self._jobs[job_id] = TransferJobStatus(
-                req_id=req_id,
-                pending_count=self.config.num_workers,
-                keys=set(keys_to_store),
-                is_store=True,
-                deferred_fence_block_ids=deferred_fence_block_ids,
-                fenced_block_ids=fenced_block_ids or None,
-            )
-
-            store_jobs[job_id] = TransferJob(
-                req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
-            )
-
-            logger.debug(
-                "Request %s offloading %s chunks upto %d tokens (job %d)",
-                req_id,
-                len(keys_to_store),
-                num_offloadable_tokens,
-                job_id,
-            )
-
-            # Full-attention rows of a finished request are NOT registered for
-            # flush detection: core retains the request and its block table
-            # until the terminal finished_sending signal, so they cannot be
-            # re-allocated underneath an in-flight store.
-
-        return store_jobs
+        # 0013: evict-only is the only mode. The eager store walk (retired
+        # after the A/B: -11..-38% prefill, -37% decode at 256k, 36x write
+        # amplification) is deleted; the only stores are eviction copies and
+        # idle-time staleness flushes, both at background priority.
+        jobs = self._drain_eviction_queue()
+        jobs.update(self._scan_idle_flush(scheduler_output))
+        return jobs
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -2216,11 +1666,10 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
-        partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=partial_store_jobs | normal_store_jobs,
+            store_jobs=normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
 
@@ -2230,11 +1679,7 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
-            if req_status.finish_pending:
-                # Held: more prepare_store calls may still be issued for this
-                # request's frontier, so on_request_finished is deferred to the
-                # terminal release in update_connector_output.
-                continue
+            # 0013: no finish hold; finalize every finished request here.
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
@@ -2252,7 +1697,6 @@ class OffloadingConnectorScheduler:
         """
         return (
             bool(self._jobs)
-            or any(status.finish_pending for status in self._req_status.values())
             or self.manager.has_pending_work()
         )
 
@@ -2367,21 +1811,9 @@ class OffloadingConnectorScheduler:
                                 ):
                                     if pos < len(state.block_ids):
                                         state.block_ids[pos] = 0
-                            elif (
-                                req_status.finish_pending
-                                and not req_status.finish_store_abandoned
-                            ):
-                                # One additional retry per actually failed full
-                                # attention key, never per admission decline.
-                                if key in req_status.finish_failed_store_keys:
-                                    req_status.finish_store_abandoned = True
-                                    logger.warning(
-                                        "Request %s: incomplete store frontier "
-                                        "abandoned: repeated drained store failure",
-                                        job_status.req_id,
-                                    )
-                                else:
-                                    req_status.finish_failed_store_keys.add(key)
+                            else:
+                                # 0013: store retries retired with the eager path.
+                                pass
                             state.next_stored_chunk_idx = min(
                                 state.next_stored_chunk_idx, idx
                             )
@@ -2416,29 +1848,12 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if (
                 req_status.finished_signaled
-                and not req_status.finish_pending
                 and not req_status.transfer_jobs
             ):
                 del self._req_status[job_status.req_id]
 
-        # Also run without completions: a skip-only batch or terminal provider
-        # can resolve a zero-admission frontier without ever creating a job.
-        for req_id, req_status in list(self._req_status.items()):
-            if (
-                req_status.finish_pending
-                and not req_status.transfer_jobs
-                and not self._has_finished_store_frontier(req_status)
-            ):
-                if not req_status.finished_signaled:
-                    req_status.finished_signaled = True
-                    self.manager.on_request_finished(req_status.req_context)
-                req_status.finish_failed_store_keys.clear()
-                del self._req_status[req_id]
-                # Aborted loads already release through finished_recving.
-                if req_id not in (connector_output.finished_recving or ()):
-                    if connector_output.finished_sending is None:
-                        connector_output.finished_sending = set()
-                    connector_output.finished_sending.add(req_id)
+        # 0013: the held-finished sweep retired with the eager drain; requests
+        # finalize in request_finished now.
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -2482,9 +1897,8 @@ class OffloadingConnectorScheduler:
 
         self._maybe_observe_lookup_async_delay(req_status)
 
-        req_status.finish_pending = True
-        req_status.finish_drain_frontier = 0
-        req_status.finish_drain_stall = 0
+        # 0013: no finish hold (the eager store drain is retired). Loads in
+        # flight still release through the normal finished path below.
         # Abort/error/ignored requests drain existing jobs but create no more.
         if request.status in (
             RequestStatus.FINISHED_STOPPED,
@@ -2505,17 +1919,14 @@ class OffloadingConnectorScheduler:
             for state, ids in zip(req_status.group_states, block_ids):
                 state.block_ids = list(ids)
 
-        if not req_status.transfer_jobs and not self._has_finished_store_frontier(
-            req_status
-        ):
+        if not req_status.transfer_jobs:
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             del self._req_status[request.request_id]
             return False, None
 
-        # Protect unsaved rows too, not just the first partially admitted batch.
-        # Core's existing delayed-free path retains GPU references and request
-        # state until update_connector_output emits the terminal release signal.
+        # 0013: transfer_jobs non-empty means loads still hold the request;
+        # with stores gone there is nothing else to hold for.
         return True, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
