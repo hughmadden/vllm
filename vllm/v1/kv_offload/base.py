@@ -148,6 +148,10 @@ class PrepareStoreOutput:
     keys_to_store: list[OffloadKey]
     store_spec: LoadStoreSpec
     evicted_keys: list[OffloadKey]
+    # Explicit policy skips, not capacity declines. Omitted keys otherwise
+    # remain retryable. Already-durable keys may also be acknowledged here;
+    # pending writes must not be acknowledged (they can still fail).
+    skipped_keys: Collection[OffloadKey] = ()
 
 
 @dataclass
@@ -355,6 +359,17 @@ class OffloadingManager(ABC):
         """
         return
 
+    def on_load_failure(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Invalidate failed objects after all ranks drain and complete_load.
+
+        Persistent managers must quarantine these keys across participants.
+        The connector also disables external lookup for the affected request,
+        so legacy managers cannot trap it in a failed-load retry loop.
+        """
+        return
+
     def take_events(self) -> Iterable[OffloadingEvent]:
         """
         Take the offloading events from the manager.
@@ -555,19 +570,47 @@ class OffloadingWorker(ABC):
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
-        """Async GPU -> offloaded medium."""
+        """Async GPU -> offloaded medium.
+
+        Returns:
+            True if transfer was submitted successfully. On False or an
+            exception, wait({job_id}) must still drain any partially issued
+            work. Register ownership before issuing copies or I/O.
+        """
 
     @abstractmethod
     def submit_load(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
-        """Async offloaded medium -> GPU."""
+        """Async offloaded medium -> GPU.
+
+        Returns:
+            True if transfer was submitted successfully. On False or an
+            exception, wait({job_id}) must still drain any partially issued
+            work. Register ownership before issuing copies or I/O.
+        """
 
     @abstractmethod
-    def get_finished(self) -> list[TransferResult]: ...
+    def get_finished(self) -> list[TransferResult]:
+        """
+        Get transfers finished since last call. Every result, including a
+        failure, certifies no further access to source/destination buffers.
+        Persistent stores report success only after durable publication.
+
+        Returns:
+            A list of TransferResults.
+        """
 
     @abstractmethod
-    def wait(self, job_ids: set[int]) -> None: ...
+    def wait(self, job_ids: set[int]) -> None:
+        """
+        Wait for all GPU, CPU and media work for these jobs to finish.
+        Unknown/unsubmitted IDs are harmless. Returning certifies no later
+        buffer access; inability to drain must raise, never return early.
+
+        Args:
+            job_ids: The set of job IDs to wait for.
+        """
 
     def shutdown(self) -> None:
         return

@@ -181,19 +181,29 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        skipped_keys: list[OffloadKey] = []
         if self.counts is not None:
-            num_keys = len(keys)
             self._record_accesses(keys)
+            skipped_keys = [
+                k for k in keys if self.counts.get(k, 0) < self.store_threshold
+            ]
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
-            self.stores_skipped_in_current_batch += num_keys - len(keys)
-        # filter out chunks that are already stored
-        keys_to_store = [k for k in keys if self._policy.get(k) is None]
+            self.stores_skipped_in_current_batch += len(skipped_keys)
+        # Pending writes may fail; only ready chunks acknowledge the frontier.
+        keys_to_store = []
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None:
+                keys_to_store.append(key)
+            elif chunk.is_ready:
+                skipped_keys.append(key)
 
         if not keys_to_store:
             return PrepareStoreOutput(
                 keys_to_store=[],
                 store_spec=self._get_load_store_spec([], []),
                 evicted_keys=[],
+                skipped_keys=skipped_keys,
             )
 
         self.allocation_sizes_in_current_batch.append(len(keys_to_store))
@@ -247,6 +257,7 @@ class CPUOffloadingManager(OffloadingManager):
             keys_to_store=keys_to_store,
             store_spec=store_spec,
             evicted_keys=to_evict,
+            skipped_keys=skipped_keys,
         )
 
     @override

@@ -84,10 +84,14 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
+    failed_jobs: set[int] = field(default_factory=set)
+    failed_load_blocks: dict[int, set[int]] = field(default_factory=dict)
 
-    def mark_completed(self, job_id: int) -> None:
-        """Record a transfer job completion from this worker."""
+    def mark_completed(self, job_id: int, success: bool = True) -> None:
+        """Record one drained outcome, including failed submissions."""
         self.completed_jobs[job_id] = 1
+        if not success:
+            self.failed_jobs.add(job_id)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -98,7 +102,14 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
+        failed_load_blocks = {
+            job_id: set(blocks) for job_id, blocks in self.failed_load_blocks.items()
+        }
+        for job_id, blocks in other.failed_load_blocks.items():
+            failed_load_blocks.setdefault(job_id, set()).update(blocks)
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            failed_jobs=self.failed_jobs | other.failed_jobs,
+            failed_load_blocks=failed_load_blocks,
         )
