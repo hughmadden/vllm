@@ -375,6 +375,12 @@ class RequestOffloadState:
     finish_store_tokens: int = 0
     finish_failed_store_keys: set[OffloadKey] = field(default_factory=set)
     finish_store_abandoned: bool = False
+    # Finish-drain liveness bound (0006): the held finished request must
+    # release even if the frontier can never complete -- persistent
+    # manager declines or permanently unmaterialized rows would otherwise
+    # hold the core request (and the client response) forever.
+    finish_drain_frontier: int = 0  # last seen sum of group frontiers
+    finish_drain_stall: int = 0     # consecutive no-progress drain steps
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -535,6 +541,12 @@ def _create_req_context(req: Request) -> ReqContext:
 
 
 class OffloadingConnectorScheduler:
+    # Maximum scheduler steps without frontier progress that a held
+    # finished request may wait for its store frontier to drain before
+    # the remainder is abandoned honestly. Bounds the terminal release
+    # (and the client response) against persistent declines or
+    # never-materialized rows (0006).
+    _FINISH_DRAIN_STEP_BOUND = 64
     """Implementation of Scheduler side methods"""
 
     def __init__(
@@ -1480,6 +1492,31 @@ class OffloadingConnectorScheduler:
                         status.req.request_id,
                     )
                     return False
+                # Liveness bound: a frontier that STOPS PROGRESSING (persistent
+                # manager declines, rows that stay null past finish) must not
+                # hold the core request -- or the client response, which core
+                # gates on the terminal finished_sending signal -- forever.
+                # Steps that advance any group's frontier reset the stall
+                # counter, so slow-but-progressing drains are never cut.
+                frontier_now = sum(
+                    state.next_stored_chunk_idx for state in status.group_states
+                )
+                if frontier_now > getattr(status, "finish_drain_frontier", 0):
+                    status.finish_drain_frontier = frontier_now
+                    status.finish_drain_stall = 0
+                    return True
+                stall = getattr(status, "finish_drain_stall", 0) + 1
+                status.finish_drain_stall = stall
+                # getattr: the bound is a class constant, but extracted
+                # method tests bind onto a plain namespace.
+                if stall > getattr(self, "_FINISH_DRAIN_STEP_BOUND", 64):
+                    status.finish_store_abandoned = True
+                    logger.warning(
+                        "Request %s: incomplete store frontier abandoned: "
+                        "drain stalled without progress",
+                        status.req.request_id,
+                    )
+                    return False
                 return True
         return False
 
@@ -2091,6 +2128,8 @@ class OffloadingConnectorScheduler:
         self._maybe_observe_lookup_async_delay(req_status)
 
         req_status.finish_pending = True
+        req_status.finish_drain_frontier = 0
+        req_status.finish_drain_stall = 0
         # Abort/error/ignored requests drain existing jobs but create no more.
         if request.status in (
             RequestStatus.FINISHED_STOPPED,
