@@ -1892,6 +1892,11 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
+        # Let connectors reduce drained all-rank outcomes before either error
+        # recovery or finished-receive processing can release/reuse KV blocks.
+        if kv_connector_output is not None and self.connector is not None:
+            self.connector.update_connector_output(kv_connector_output)
+
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
@@ -3008,9 +3013,7 @@ class Scheduler(SchedulerInterface):
             schedule the request during the next step.
         """
 
-        if self.connector is not None:
-            self.connector.update_connector_output(kv_connector_output)
-
+        # Connector outcomes were reduced before invalid-block recovery.
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
@@ -3068,8 +3071,28 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            block_groups = self.kv_cache_manager.get_block_ids(req_id)
+            if len(block_groups) != 1:
+                # Physical IDs share the pool, but indices in unequal groups
+                # do NOT share token geometry. Conservatively invalidate the
+                # affected request, retaining its accepted input/output tokens.
+                # Never flatten groups to calculate a token offset.
+                if any(
+                    bid != 0 and bid in invalid_block_ids
+                    for group in block_groups for bid in group
+                ):
+                    affected_req_ids.add(req_id)
+                    total_affected_tokens += max(
+                        0, request.num_computed_tokens
+                        - num_scheduled_tokens.get(req_id, 0)
+                    )
+                    request.num_computed_tokens = 0
+                    if evict_blocks:
+                        blocks_to_evict.update(
+                            bid for group in block_groups for bid in group if bid != 0
+                        )
+                continue
+            (req_block_ids,) = block_groups
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -3174,8 +3197,19 @@ class Scheduler(SchedulerInterface):
         # evict invalid blocks and downstream dependent blocks from cache
         # only when not using recompute policy (where blocks will be recomputed
         # and reused by other requests sharing them)
-        if sync_blocks_to_evict and not self.recompute_kv_load_failures:
+        grouped_sync_retries = [
+            self.requests[req_id] for req_id in sync_failed_req_ids
+            if len(self.kv_cache_manager.get_block_ids(req_id)) != 1
+        ]
+        if sync_blocks_to_evict and (should_fail or grouped_sync_retries):
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
+        if not should_fail:
+            for request in grouped_sync_retries:
+                # SWA/SSM tables can contain skipped rows: resetting only a
+                # token cursor would write through an invalid table. Use the
+                # existing preemption/free fence and fresh all-group allocation.
+                self.running.remove(request)
+                self._preempt_request(request, time.monotonic())
 
         if should_fail:
             all_failed_req_ids = async_failed_req_ids | sync_failed_req_ids
