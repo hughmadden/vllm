@@ -191,6 +191,11 @@ class BlockPool:
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
+        # 0009 write-behind: optional sink consulted when a cached
+        # block's refcount reaches zero; True holds it out of the free
+        # queue in the sink's deferred-free registry (never blocks
+        # allocation; a full sink declines and the block frees).
+        self.eviction_sink = None
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
@@ -750,12 +755,33 @@ class BlockPool:
                     blocks_to_evict_first.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
+                    if self.eviction_sink is not None and self.eviction_sink(
+                        block
+                    ):
+                        # 0009: the write-behind sink holds the block in
+                        # its deferred-free registry; it re-queues via
+                        # return_held_blocks when the copy drains.
+                        continue
                     blocks_to_evict_last.append(block)
 
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+
+    def set_eviction_sink(self, sink) -> None:
+        """Bind the 0009 write-behind sink (or None to unbind)."""
+        self.eviction_sink = sink
+
+    def return_held_blocks(self, ordered_blocks) -> None:
+        """Return sink-held blocks to the free queue.
+
+        Held blocks already had their refcount decremented when held;
+        this re-queues them WITHOUT another decrement.
+        """
+        self.free_block_queue.append_n(
+            [b for b in ordered_blocks if not b.is_null]
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

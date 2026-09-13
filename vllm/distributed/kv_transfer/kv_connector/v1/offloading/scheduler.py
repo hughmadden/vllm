@@ -56,6 +56,7 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -575,6 +576,26 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        # 0009 write-behind mode (DESIGN-EVICT-ONLY-SPIKE-20260912).
+        extra_cfg = getattr(spec, "extra_config", None) or {}
+        self._evict_only = extra_cfg.get("store_mode") == "evict_only"
+        # R3 small-prefill read gate: smaller requests never consult the
+        # disk tier (a small RAM-miss recomputes cheaper than scan+read).
+        self._min_disk_lookup_tokens = int(
+            extra_cfg.get("min_disk_lookup_tokens", 4096)
+        )
+        self._held_evictions = {}
+        self._eviction_hold_cap = int(extra_cfg.get("eviction_hold_cap", 4096))
+        self._eviction_release_watermark = int(
+            extra_cfg.get("eviction_release_watermark", 8192)
+        )
+        self._eviction_store_per_step = int(
+            extra_cfg.get("eviction_store_per_step", 8)
+        )
+        self._block_pool = None
+        self._eviction_skips = 0
+        self._small_lookup_skips = 0
+        self._eviction_job_blocks = {}
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -1556,10 +1577,134 @@ class OffloadingConnectorScheduler:
                 return True
         return False
 
+    def bind_block_pool(self, block_pool) -> None:
+        # 0009: install the write-behind eviction sink. The sink declines
+        # unless evict-only mode is active, so binding is harmless in
+        # eager mode.
+        self._block_pool = block_pool
+        block_pool.set_eviction_sink(self._defer_evicted_block)
+
+    def _defer_evicted_block(self, block) -> bool:
+        """0009 eviction sink: hold an evicted block for a background copy.
+
+        Called by the block pool when a cached block's refcount reaches
+        zero. True holds it in the deferred-free registry (re-queued via
+        return_held_blocks when the copy drains); False frees normally.
+        Holding is credit-bounded; overflow frees unstored and counts the
+        skip -- the tier degrades to less coverage, never to stalls.
+        """
+        if not getattr(self, "_evict_only", False):
+            return False
+        raw_hash = block.block_hash
+        if raw_hash is None:
+            return False
+        group_idx = get_group_id(raw_hash)
+        block_hash = get_block_hash(raw_hash)
+        if group_idx is None or block_hash is None:
+            return False
+        if block.block_id in self._held_evictions:
+            # Re-offer of an already-held block: not a skip.
+            return False
+        if len(self._held_evictions) >= self._eviction_hold_cap:
+            self._eviction_skips += 1
+            return False
+        # Demand-aware holding (live-learned 2026-09-12): the scheduler's
+        # accounting assumes every refcount-zero block is in the free
+        # queue; held blocks are invisible to it, and a flood can drain
+        # the queue to the assertion. Under free-queue pressure, release
+        # instead of holding -- coverage degrades, allocation never
+        # stalls. Same-thread as allocation, so the check is race-free.
+        pool = getattr(self, "_block_pool", None)
+        if pool is not None:
+            free_blocks = pool.get_num_free_blocks()
+            held = len(self._held_evictions)
+            if free_blocks < self._eviction_release_watermark + held:
+                self._eviction_skips += 1
+                return False
+        self._held_evictions[block.block_id] = (
+            make_offload_key(block_hash, group_idx),
+            group_idx,
+        )
+        return True
+
+    def _drain_eviction_queue(self) -> dict:
+        """Turn held evictions into at most one bounded store job.
+
+        Held blocks are outside the pool, so copies read stable bytes
+        with no reuse fence. Declined keys (already durable, or pressure)
+        release their blocks immediately; admitted ones stay held until
+        complete_store drains (release in update_connector_output).
+        """
+        if not getattr(self, "_held_evictions", None):
+            return {}
+        pool = getattr(self, "_block_pool", None)
+        if pool is not None:
+            held_now = list(self._held_evictions)
+            pressure = (
+                self._eviction_release_watermark
+                + len(held_now)
+                - pool.get_num_free_blocks()
+            )
+            if pressure > 0:
+                # Allocation needs the memory back: release the newest
+                # holds first (least-copied investment), then still skip
+                # the job this step.
+                released = [
+                    pool.blocks[bid]
+                    for bid in held_now[max(0, len(held_now) - pressure):]
+                ]
+                for bid in held_now[max(0, len(held_now) - pressure):]:
+                    self._held_evictions.pop(bid, None)
+                if released:
+                    pool.return_held_blocks(released)
+                return {}
+        from types import SimpleNamespace as _NS
+
+        items = list(self._held_evictions.items())[: self._eviction_store_per_step]
+        keys = [pair[0] for _, pair in items]
+        store_output = self.manager.prepare_store(
+            keys, _NS(req_id="eviction-sync")
+        )
+        admitted = set(store_output.keys_to_store) if store_output else set()
+        job_blocks = [bid for bid, pair in items if pair[0] in admitted]
+        if self._block_pool is not None:
+            released = [self._block_pool.blocks[bid] for bid, _ in items
+                        if bid not in job_blocks]
+            if released:
+                self._block_pool.return_held_blocks(released)
+        for bid, _ in items:
+            if bid not in job_blocks:
+                self._held_evictions.pop(bid, None)
+        if not job_blocks:
+            return {}
+        src_spec = GPULoadStoreSpec(
+            job_blocks, group_sizes=[len(job_blocks)], block_indices=[0]
+        )
+        dst_spec = store_output.store_spec
+        job_id = self._generate_job_id()
+        self._eviction_job_blocks[job_id] = list(job_blocks)
+        # Register the status exactly like the eager path does: the
+        # completion loop keys on _jobs[job_id].is_store.
+        self._jobs[job_id] = TransferJobStatus(
+            req_id="eviction-sync",
+            pending_count=self.config.num_workers,
+            keys=set(admitted),
+            is_store=True,
+        )
+        job = TransferJob(
+            req_id="eviction-sync", src_spec=src_spec, dst_spec=dst_spec
+        )
+        return {job_id: job}
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
+        # 0009 evict-only: no eager offers, ever (R1 -- zero BAU tax by
+        # construction). The only stores are eviction copies, drained
+        # below at background priority.
+        if getattr(self, "_evict_only", False):
+            return self._drain_eviction_queue()
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
         # Drain held finished requests first, even on no-forward/idle steps.
@@ -2025,6 +2170,17 @@ class OffloadingConnectorScheduler:
                 continue
             assert job_status.pending_count == 0
 
+            if job_status.is_store and job_status.req_id == "eviction-sync":
+                # 0009: the eviction copy drained; release the held
+                # blocks back to the pool (durable or not).
+                held = getattr(self, "_eviction_job_blocks", {}).pop(job_id, [])
+                if held and self._block_pool is not None:
+                    self._block_pool.return_held_blocks(
+                        [self._block_pool.blocks[bid] for bid in held]
+                    )
+                self._remove_pending_job(job_id, job_status.fenced_block_ids)
+                del self._jobs[job_id]
+                continue
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(

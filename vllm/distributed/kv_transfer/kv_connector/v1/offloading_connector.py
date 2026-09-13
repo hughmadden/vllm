@@ -76,6 +76,13 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 spec, vllm_config, kv_cache_config
             )
 
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        # 0009 write-behind: upstream hook that hands the scheduler
+        # connector the GPU block pool. The sink declines unless the
+        # spec selected evict-only mode, so other modes are unaffected.
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_block_pool(gpu_block_pool)
+
     def shutdown(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.shutdown()

@@ -120,6 +120,12 @@ class OffloadPolicy(Enum):
     # Offload all chunks for the request, including prefix hits.
     # Used by tiers that need the complete KV context for a request.
     REQUEST_LEVEL = "request_level"
+    # Write-behind (0009): nothing is stored on the request path. The
+    # disk tier copies chunks only when the GPU prefix cache evicts
+    # them (deferred-free interception), at background priority. This is
+    # the dial endpoint "dirty ratio 0" of the write-behind design
+    # (DESIGN-EVICT-ONLY-SPIKE-20260912.md).
+    EVICT_ONLY = "evict_only"
 
 
 @dataclass
