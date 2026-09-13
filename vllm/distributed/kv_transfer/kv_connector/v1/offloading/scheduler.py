@@ -450,7 +450,15 @@ class RequestOffloadState:
         and a permanent hole breaks prefix-reuse lookup. ``is_finished`` is
         monotonic, so the finish-time calls all see the lifted exclusion.
         """
-        num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
+        # At finish the final partial chunk is stable and must count:
+        # a same-prompt repeat resumes at the full-prompt boundary, and
+        # with the floor the whole store frontier stops one chunk short
+        # of where the sibling groups' end-states live, so the tier
+        # can never assemble a complete boundary snapshot (0007).
+        if self.req.is_finished():
+            num_chunks = cdiv(num_offloadable_tokens, group_config.tokens_per_chunk)
+        else:
+            num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         # Finished requests have no pending speculation.
         if group_config.is_eagle_group and is_decoding and not self.req.is_finished():
