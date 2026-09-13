@@ -613,6 +613,11 @@ class OffloadingConnectorScheduler:
             extra_cfg.get("idle_flush_scan_seconds", 5)
         )
         self._block_last_seen = {}
+        # 0014: block_id -> (raw_hash, group_idx) identities recorded from
+        # the request path. Mamba/KDA rolling-state blocks are
+        # underrepresented in the pool hash index, so the idle-time scan
+        # cannot rely on the index alone to enumerate them.
+        self._seen_blocks = {}
         self._last_flush_scan = 0.0
         self.idle_flush_candidates = 0
         self.idle_flush_enqueued = 0
@@ -1439,24 +1444,66 @@ class OffloadingConnectorScheduler:
         return True
 
     def _track_block_seen(self, req_status) -> None:
-        """0012: refresh last-seen times for a request's blocks.
+        """0012/0014: refresh last-seen times AND identities for a
+        request's blocks.
 
         Called on the scheduler thread for every scheduled request; ages
-        feed the staleness scan. The map is pruned lazily by the scan.
+        feed the staleness scan. ``_seen_blocks`` additionally records
+        ``block_id -> (raw_hash, group_idx)`` for every allocated block of
+        every group -- including mamba groups, whose rolling-state blocks
+        lose or never get persistent prefix-cache hashes and so are
+        underrepresented in the pool hash index (0014: without this the
+        idle-time scan could never offer them and a session could never
+        become fully durable across all groups). The raw hash is the
+        request-path BlockHashWithGroupId bytes built from the same flat
+        ``req.block_hashes`` walk ``update_offload_keys`` keys from: group
+        g's chunk c pairs with ``block_ids[c*blocks_per_chunk :
+        (c+1)*blocks_per_chunk]`` and the hash at flat index
+        ``(c+1)*hashes_per_chunk - 1``. ``OffloadKey`` and
+        ``BlockHashWithGroupId`` share the ``hash || 4-byte group id``
+        layout, so the scan decomposes it with the usual helpers. Both
+        maps are pruned lazily by the scan.
         """
         now = time.monotonic()
-        for state in req_status.group_states:
-            for bid in state.block_ids or ():
+        seen_blocks = getattr(self, "_seen_blocks", None)
+        if seen_blocks is None:
+            seen_blocks = self._seen_blocks = {}
+        req = req_status.req
+        block_hashes = getattr(req, "block_hashes", None) or ()
+        blocks_per_chunk = self.config.blocks_per_chunk
+        for group_config, state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            block_ids = state.block_ids or ()
+            for bid in block_ids:
                 self._block_last_seen[bid] = now
+            hashes_per_chunk = group_config.hashes_per_chunk
+            for chunk_idx in range(len(block_ids) // blocks_per_chunk):
+                hash_idx = (chunk_idx + 1) * hashes_per_chunk - 1
+                if hash_idx >= len(block_hashes):
+                    break
+                raw_hash = make_offload_key(
+                    block_hashes[hash_idx], group_config.group_idx
+                )
+                start = chunk_idx * blocks_per_chunk
+                for pos in range(start, start + blocks_per_chunk):
+                    bid = block_ids[pos]
+                    if bid != 0:
+                        seen_blocks[bid] = (raw_hash, group_config.group_idx)
 
     def _scan_idle_flush(self, scheduler_output) -> dict[int, "TransferJob"]:
-        """0012: on a decode-free step, offer stale APC blocks to disk.
+        """0012/0014: on a decode-free step, offer stale APC blocks to disk.
 
-        Population: the block pool's own hash index (exactly the cache).
+        Population: the UNION of (a) the block pool's own hash index and
+        (b) the request-path ``_seen_blocks`` identities, deduped by
+        block_id (0014: the index alone underrepresents mamba/KDA groups,
+        so a pool-map-only scan could never make a session fully durable).
         A block is stale when unseen for idle_flush_stale_seconds or
-        never seen at all this process life. Copies are in place: blocks
-        remain APC-resident; reuse is fenced through
-        _block_id_to_pending_jobs so a copy reads stable bytes and
+        never seen at all this process life. Groups whose spec is not
+        prefix-cacheable (the 0008 kpool rolling scratch) are excluded
+        from store/load, so the flusher must not publish them either.
+        Copies are in place: blocks remain APC-resident; reuse is fenced
+        through _block_id_to_pending_jobs so a copy reads stable bytes and
         allocation is never blocked (flush-and-await, the 0002 fence).
         """
         if not getattr(self, "_idle_flush_enabled", False):
@@ -1477,13 +1524,29 @@ class OffloadingConnectorScheduler:
         if pool is None:
             return {}
         stale_before = now - self._idle_flush_stale_seconds
+        # 0008 guard, mirrored for the flusher: the kpool rolling scratch
+        # (prefix_cacheable=False) is excluded from store/load, so it must
+        # never be offered for a disk copy either. Defence in depth for
+        # the pool-map source (its manager's cache_blocks no-ops, so its
+        # blocks never enter the index) and load-bearing for the
+        # request-path source below, which does see every group.
+        cacheable_groups = {
+            group_config.group_idx
+            for group_config in self.config.kv_group_configs
+            if getattr(group_config.kv_cache_spec, "prefix_cacheable", True)
+        }
         # BlockHashToBlockMap: hash -> {block_id: block}; a hash can map to
         # several physical blocks (collision-free by id), any serves for
         # the age check; take the first per hash.
         raw_map = getattr(pool.cached_block_hash_to_block, "_cache", None)
         if raw_map is None:
             return {}
-        items = []
+        # 0014: population is the union of the pool hash index and the
+        # request-path identities, deduped by block_id. The index alone
+        # underrepresents mamba/KDA groups (rolling-state blocks lose or
+        # never get persistent hashes), so a pool-map-only scan can never
+        # make a session fully durable across all groups.
+        candidates: dict[int, tuple[bytes, int]] = {}
         for raw_hash, inner in list(raw_map.items()):
             # Values are block-id dicts in some trees and bare blocks in
             # others; handle both.
@@ -1493,29 +1556,47 @@ class OffloadingConnectorScheduler:
                 block = inner
             if block is None:
                 continue
-            bid = block.block_id
+            candidates.setdefault(block.block_id, (raw_hash, get_group_id(raw_hash)))
+        seen_blocks = getattr(self, "_seen_blocks", None)
+        if seen_blocks:
+            for bid, (raw_hash, group_idx) in list(seen_blocks.items()):
+                candidates.setdefault(bid, (raw_hash, group_idx))
+        items = []
+        for bid, (raw_hash, group_idx) in candidates.items():
             seen = self._block_last_seen.get(bid)
             if seen is not None and seen > stale_before:
                 self.idle_flush_skipped_fresh += 1
                 continue
-            group_idx = get_group_id(raw_hash)
+            if group_idx not in cacheable_groups:
+                continue
             block_hash = get_block_hash(raw_hash)
-            if group_idx is None or block_hash is None:
+            if block_hash is None:
                 continue
             self.idle_flush_candidates += 1
             items.append((bid, make_offload_key(block_hash, group_idx)))
             if len(items) >= self._idle_flush_per_scan:
                 break
-        # prune the age map while we are here (bounded: pool-sized)
+        # prune both maps while we are here. Live means pool-map-resident
+        # OR referenced by a tracked request: mamba blocks are precisely
+        # the ones absent from the map, so map-only membership would prune
+        # the entries the union population depends on (bounded: pool +
+        # request blocks).
         live = set()
         for inner in raw_map.values():
             if hasattr(inner, "values"):
                 live.update(b.block_id for b in inner.values())
             elif inner is not None:
                 live.add(inner.block_id)
+        for req_status in getattr(self, "_req_status", {}).values():
+            for state in req_status.group_states:
+                live.update(state.block_ids or ())
         for bid in list(self._block_last_seen):
             if bid not in live:
                 del self._block_last_seen[bid]
+        if seen_blocks is not None:
+            for bid in list(seen_blocks):
+                if bid not in live:
+                    del seen_blocks[bid]
         if not items:
             return {}
         from types import SimpleNamespace as _NS
