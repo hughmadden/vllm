@@ -284,6 +284,15 @@ class OffloadingManager(ABC):
         """
         return
 
+    def can_store(self) -> bool:
+        """Whether retrying store admission can still make progress.
+
+        Return False only for terminal/disabled storage, not temporary pressure.
+        This abandons unsaved finished-request frontiers without acknowledging
+        them, and never releases active transfers before their all-rank drain.
+        """
+        return True
+
     @abstractmethod
     def prepare_store(
         self,

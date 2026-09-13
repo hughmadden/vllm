@@ -77,7 +77,8 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
-    # Store source blocks fenced after the request finishes.
+    # Full-attention source blocks stay protected by the request's ref_cnt,
+    # including while finished-request store frontiers drain.
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
@@ -369,6 +370,11 @@ class RequestOffloadState:
     finished_signaled: bool = False
     # Set once an all-rank drained load for this request failed.
     load_failed: bool = False
+    # Core retains the request and its current GPU table until finished_sending.
+    finish_pending: bool = False
+    finish_store_tokens: int = 0
+    finish_failed_store_keys: set[OffloadKey] = field(default_factory=set)
+    finish_store_abandoned: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -596,9 +602,8 @@ class OffloadingConnectorScheduler:
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
-        # Populated only for finished requests (running-request blocks are
-        # protected by their ref_cnt) and for sliding window blocks (which can
-        # be freed before a request finishes).
+        # Sliding window blocks can be freed before a request finishes.
+        # Full-attention blocks retain request ownership through store drain.
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
@@ -1447,35 +1452,81 @@ class OffloadingConnectorScheduler:
                 frontier = idx + 1
             state.next_stored_chunk_idx = frontier
 
+    def _has_finished_store_frontier(self, status: RequestOffloadState) -> bool:
+        """Whether a held finished request still owes eligible stable keys.
+
+        ``storable_chunks`` supplies the per-group bound; ``is_finished`` is
+        already True here, so the EAGLE/MTP tail exclusion is lifted and the
+        final chunk counts. A permanently disabled store abandons the unsaved
+        tail honestly rather than acknowledging or fabricating it.
+        """
+        if not status.finish_pending or status.finish_store_abandoned:
+            return False
+        for config, state in zip(self.config.kv_group_configs, status.group_states):
+            end = status.storable_chunks(config, state, status.finish_store_tokens)
+            if state.next_stored_chunk_idx < end:
+                if not self.manager.can_store():
+                    status.finish_store_abandoned = True
+                    logger.warning(
+                        "Request %s: incomplete store frontier abandoned: "
+                        "storage disabled",
+                        status.req.request_id,
+                    )
+                    return False
+                return True
+        return False
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
-        for req_id in chain(
-            scheduler_output.num_scheduled_tokens,
-            scheduler_output.finished_req_ids or (),
-        ):
+        # Drain held finished requests first, even on no-forward/idle steps.
+        # Otherwise a shared admission quantum can starve their GPU ownership.
+        requests = dict.fromkeys(
+            rid for rid, status in self._req_status.items() if status.finish_pending
+        )
+        requests.update(
+            dict.fromkeys(
+                chain(
+                    scheduler_output.num_scheduled_tokens,
+                    scheduler_output.finished_req_ids or (),
+                )
+            )
+        )
+        for req_id in requests:
             req_status = self._req_status.get(req_id)
-            if req_status is None:
+            if req_status is None or not self.manager.can_store():
                 continue
             req = req_status.req
 
-            if req.status is RequestStatus.FINISHED_ABORTED:
-                num_tokens_after_batch = req.num_computed_tokens
-            elif req.is_finished():
-                # Clamp to the GPU prefix cache's commit point. The final sampled
-                # token's slot is never committed (under spec decode it holds a
-                # rejected draft's KV), so a block ending there must not be stored.
-                num_tokens_after_batch = max(req.num_prompt_tokens, req.num_tokens - 1)
+            if req_status.finish_pending:
+                # The token boundary and the GPU table were snapshotted at
+                # request_finished; they cannot move while core holds the rows.
+                if not self._has_finished_store_frontier(req_status):
+                    continue
+                num_offloadable_tokens = req_status.finish_store_tokens
             else:
-                num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
+                if req.status is RequestStatus.FINISHED_ABORTED:
+                    num_tokens_after_batch = req.num_computed_tokens
+                elif req.is_finished():
+                    # Clamp to the GPU prefix cache's commit point. The final
+                    # sampled token's slot is never committed (under spec decode
+                    # it holds a rejected draft's KV), so a block ending there
+                    # must not be stored.
+                    num_tokens_after_batch = max(
+                        req.num_prompt_tokens, req.num_tokens - 1
+                    )
+                else:
+                    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    num_tokens_after_batch = (
+                        req.num_computed_tokens + num_scheduled_tokens
+                    )
 
-            num_offloadable_tokens = self._calc_num_offloadable_tokens(
-                req_status, num_tokens_after_batch
-            )
+                num_offloadable_tokens = self._calc_num_offloadable_tokens(
+                    req_status, num_tokens_after_batch
+                )
             prompt_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, req.num_prompt_tokens
             )
@@ -1704,8 +1755,7 @@ class OffloadingConnectorScheduler:
             for bid in fenced_block_ids:
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
 
-            # the non-sliding window blocks will be watched only
-            # when the request finishes
+            # Full-attention blocks remain held by core request ownership.
             self._jobs[job_id] = TransferJobStatus(
                 req_id=req_id,
                 pending_count=self.config.num_workers,
@@ -1727,12 +1777,10 @@ class OffloadingConnectorScheduler:
                 job_id,
             )
 
-            if req.is_finished():
-                # Register non-sliding-window blocks for flush detection.
-                for bid in deferred_fence_block_ids:
-                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-                    if bid in self._current_batch_allocated_block_ids:
-                        self._current_batch_jobs_to_flush.add(job_id)
+            # Full-attention rows of a finished request are NOT registered for
+            # flush detection: core retains the request and its block table
+            # until the terminal finished_sending signal, so they cannot be
+            # re-allocated underneath an in-flight store.
 
         return store_jobs
 
@@ -1783,6 +1831,11 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
+            if req_status.finish_pending:
+                # Held: more prepare_store calls may still be issued for this
+                # request's frontier, so on_request_finished is deferred to the
+                # terminal release in update_connector_output.
+                continue
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
@@ -1798,7 +1851,11 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            bool(self._jobs)
+            or any(status.finish_pending for status in self._req_status.values())
+            or self.manager.has_pending_work()
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -1892,6 +1949,21 @@ class OffloadingConnectorScheduler:
                                 ):
                                     if pos < len(state.block_ids):
                                         state.block_ids[pos] = 0
+                            elif (
+                                req_status.finish_pending
+                                and not req_status.finish_store_abandoned
+                            ):
+                                # One additional retry per actually failed full
+                                # attention key, never per admission decline.
+                                if key in req_status.finish_failed_store_keys:
+                                    req_status.finish_store_abandoned = True
+                                    logger.warning(
+                                        "Request %s: incomplete store frontier "
+                                        "abandoned: repeated drained store failure",
+                                        job_status.req_id,
+                                    )
+                                else:
+                                    req_status.finish_failed_store_keys.add(key)
                             state.next_stored_chunk_idx = min(
                                 state.next_stored_chunk_idx, idx
                             )
@@ -1920,17 +1992,35 @@ class OffloadingConnectorScheduler:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.
                 self._remove_pending_job(job_id, job_status.fenced_block_ids)
-                # Non-sliding-window blocks are only tracked after
-                # request_finished, so only clean up for finished requests.
-                if req_status.req.is_finished():
-                    self._remove_pending_job(
-                        job_id, job_status.deferred_fence_block_ids
-                    )
+                # Full-attention rows remain owned by the held core request.
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if req_status.finished_signaled and not req_status.transfer_jobs:
+            if (
+                req_status.finished_signaled
+                and not req_status.finish_pending
+                and not req_status.transfer_jobs
+            ):
                 del self._req_status[job_status.req_id]
+
+        # Also run without completions: a skip-only batch or terminal provider
+        # can resolve a zero-admission frontier without ever creating a job.
+        for req_id, req_status in list(self._req_status.items()):
+            if (
+                req_status.finish_pending
+                and not req_status.transfer_jobs
+                and not self._has_finished_store_frontier(req_status)
+            ):
+                if not req_status.finished_signaled:
+                    req_status.finished_signaled = True
+                    self.manager.on_request_finished(req_status.req_context)
+                req_status.finish_failed_store_keys.clear()
+                del self._req_status[req_id]
+                # Aborted loads already release through finished_recving.
+                if req_id not in (connector_output.finished_recving or ()):
+                    if connector_output.finished_sending is None:
+                        connector_output.finished_sending = set()
+                    connector_output.finished_sending.add(req_id)
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -1950,6 +2040,7 @@ class OffloadingConnectorScheduler:
     def request_finished(
         self,
         request: Request,
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Called when a request has finished, before its blocks are freed.
@@ -1973,20 +2064,39 @@ class OffloadingConnectorScheduler:
 
         self._maybe_observe_lookup_async_delay(req_status)
 
-        # Update offload keys with final block hash so _build_store_jobs can
-        # create store jobs for the last block(s) on the next schedule step.
-        req_status.update_offload_keys()
+        req_status.finish_pending = True
+        # Abort/error/ignored requests drain existing jobs but create no more.
+        if request.status in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            # Update offload keys with final chunk hash so _build_store_jobs can
+            # create store jobs for the last chunk(s) on later schedule steps.
+            req_status.update_offload_keys()
+            # Same clamp _build_store_jobs applies to a finished request: the
+            # final sampled token's slot is never committed.
+            req_status.finish_store_tokens = self._calc_num_offloadable_tokens(
+                req_status, max(request.num_prompt_tokens, request.num_tokens - 1)
+            )
+            # Core has already removed out-of-window rows. The historical
+            # connector table can still name freed SWA blocks; copy the actual
+            # retained table, including null slots, before admitting more work.
+            assert len(block_ids) == len(req_status.group_states)
+            for state, ids in zip(req_status.group_states, block_ids):
+                state.block_ids = list(ids)
 
-        # Keep req_status alive: _build_store_jobs will process finished_req_ids
-        # on the next step and handle cleanup after creating store jobs.
-        # Register deferred fences so future block reuse triggers a flush via
-        # _block_id_to_pending_jobs.
-        for job_id in req_status.transfer_jobs:
-            job_status = self._jobs[job_id]
-            for bid in job_status.deferred_fence_block_ids or ():
-                self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+        if not req_status.transfer_jobs and not self._has_finished_store_frontier(
+            req_status
+        ):
+            req_status.finished_signaled = True
+            self.manager.on_request_finished(req_status.req_context)
+            del self._req_status[request.request_id]
+            return False, None
 
-        return False, None
+        # Protect unsaved rows too, not just the first partially admitted batch.
+        # Core's existing delayed-free path retains GPU references and request
+        # state until update_connector_output emits the terminal release signal.
+        return True, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Drain pending KV cache events.
@@ -2003,7 +2113,7 @@ class OffloadingConnectorScheduler:
 
     def reset_cache(self) -> bool:
         """Reset only at quiescence; callers may retry after idle drain."""
-        if self._jobs or self.manager.has_pending_work():
+        if self.has_pending_push_work():
             return False
 
         # reset_cache cannot be called in the middle of a schedule step
