@@ -597,6 +597,26 @@ class OffloadingConnectorScheduler:
             extra_cfg.get("eviction_store_high_watermark", 0)
         )
         self._eviction_pressure_skips = 0
+        # 0012 idle-time staleness flusher: durability for stale APC
+        # content without memory pressure, at decode-zero cost. Runs on
+        # decode-free steps only; copies are in place (blocks stay in the
+        # APC) with reuse fenced via _block_id_to_pending_jobs.
+        self._idle_flush_enabled = (
+            self._evict_only
+            and extra_cfg.get("idle_flush_enabled", True)
+        )
+        self._idle_flush_stale_seconds = float(
+            extra_cfg.get("idle_flush_stale_seconds", 3600)
+        )
+        self._idle_flush_per_scan = int(extra_cfg.get("idle_flush_per_scan", 32))
+        self._idle_flush_scan_seconds = float(
+            extra_cfg.get("idle_flush_scan_seconds", 5)
+        )
+        self._block_last_seen = {}
+        self._last_flush_scan = 0.0
+        self.idle_flush_candidates = 0
+        self.idle_flush_enqueued = 0
+        self.idle_flush_skipped_fresh = 0
         self._eviction_store_per_step = int(
             extra_cfg.get("eviction_store_per_step", 8)
         )
@@ -1097,6 +1117,7 @@ class OffloadingConnectorScheduler:
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+        self._track_block_seen(req_status)
 
         num_hit_tokens: int | None
         if request.skip_reading_prefix_cache or req_status.load_failed:
@@ -1643,6 +1664,117 @@ class OffloadingConnectorScheduler:
         )
         return True
 
+    def _track_block_seen(self, req_status) -> None:
+        """0012: refresh last-seen times for a request's blocks.
+
+        Called on the scheduler thread for every scheduled request; ages
+        feed the staleness scan. The map is pruned lazily by the scan.
+        """
+        now = time.monotonic()
+        for state in req_status.group_states:
+            for bid in state.block_ids or ():
+                self._block_last_seen[bid] = now
+
+    def _scan_idle_flush(self, scheduler_output) -> dict[int, "TransferJob"]:
+        """0012: on a decode-free step, offer stale APC blocks to disk.
+
+        Population: the block pool's own hash index (exactly the cache).
+        A block is stale when unseen for idle_flush_stale_seconds or
+        never seen at all this process life. Copies are in place: blocks
+        remain APC-resident; reuse is fenced through
+        _block_id_to_pending_jobs so a copy reads stable bytes and
+        allocation is never blocked (flush-and-await, the 0002 fence).
+        """
+        if not getattr(self, "_idle_flush_enabled", False):
+            return {}
+        now = time.monotonic()
+        if now - self._last_flush_scan < self._idle_flush_scan_seconds:
+            return {}
+        # Decode-free gate: skip the scan when ANY scheduled request is in
+        # its decode phase (num_scheduled_tokens <= 2). Prefill chunks and
+        # finish-drain steps carry larger counts; those are the idle-time
+        # windows the flusher rides. R1 by construction: a decode step
+        # never pays for persistence.
+        counts = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        if any(n <= 2 for n in counts.values()):
+            return {}
+        self._last_flush_scan = now
+        pool = getattr(self, "_block_pool", None)
+        if pool is None:
+            return {}
+        stale_before = now - self._idle_flush_stale_seconds
+        # BlockHashToBlockMap: hash -> {block_id: block}; a hash can map to
+        # several physical blocks (collision-free by id), any serves for
+        # the age check; take the first per hash.
+        raw_map = getattr(pool.cached_block_hash_to_block, "_cache", None)
+        if raw_map is None:
+            return {}
+        items = []
+        for raw_hash, inner in list(raw_map.items()):
+            # Values are block-id dicts in some trees and bare blocks in
+            # others; handle both.
+            if hasattr(inner, "values"):
+                block = next(iter(inner.values()), None)
+            else:
+                block = inner
+            if block is None:
+                continue
+            bid = block.block_id
+            seen = self._block_last_seen.get(bid)
+            if seen is not None and seen > stale_before:
+                self.idle_flush_skipped_fresh += 1
+                continue
+            group_idx = get_group_id(raw_hash)
+            block_hash = get_block_hash(raw_hash)
+            if group_idx is None or block_hash is None:
+                continue
+            self.idle_flush_candidates += 1
+            items.append((bid, make_offload_key(block_hash, group_idx)))
+            if len(items) >= self._idle_flush_per_scan:
+                break
+        # prune the age map while we are here (bounded: pool-sized)
+        live = set()
+        for inner in raw_map.values():
+            if hasattr(inner, "values"):
+                live.update(b.block_id for b in inner.values())
+            elif inner is not None:
+                live.add(inner.block_id)
+        for bid in list(self._block_last_seen):
+            if bid not in live:
+                del self._block_last_seen[bid]
+        if not items:
+            return {}
+        from types import SimpleNamespace as _NS
+
+        keys = [key for _, key in items]
+        store_output = self.manager.prepare_store(
+            keys, _NS(req_id="idle-flush")
+        )
+        admitted = set(store_output.keys_to_store) if store_output else set()
+        job_blocks = [bid for bid, key in items if key in admitted]
+        if not job_blocks:
+            return {}
+        self.idle_flush_enqueued += len(job_blocks)
+        src_spec = GPULoadStoreSpec(
+            job_blocks, group_sizes=[len(job_blocks)], block_indices=[0]
+        )
+        dst_spec = store_output.store_spec
+        job_id = self._generate_job_id()
+        # In-place copies: fence reuse, do NOT hold the blocks.
+        for bid in job_blocks:
+            self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+        self._jobs[job_id] = TransferJobStatus(
+            req_id="idle-flush",
+            pending_count=self.config.num_workers,
+            keys=set(admitted),
+            is_store=True,
+            fenced_block_ids=list(job_blocks),
+        )
+        job = TransferJob(
+            req_id="idle-flush", src_spec=src_spec, dst_spec=dst_spec
+        )
+        return {job_id: job}
+
     def _drain_eviction_queue(self) -> dict:
         """Turn held evictions into at most one bounded store job.
 
@@ -1720,7 +1852,9 @@ class OffloadingConnectorScheduler:
         # construction). The only stores are eviction copies, drained
         # below at background priority.
         if getattr(self, "_evict_only", False):
-            return self._drain_eviction_queue()
+            jobs = self._drain_eviction_queue()
+            jobs.update(self._scan_idle_flush(scheduler_output))
+            return jobs
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
         # Drain held finished requests first, even on no-forward/idle steps.
@@ -2186,7 +2320,8 @@ class OffloadingConnectorScheduler:
                 continue
             assert job_status.pending_count == 0
 
-            if job_status.is_store and job_status.req_id == "eviction-sync":
+            if (job_status.is_store
+                    and job_status.req_id in ("eviction-sync", "idle-flush")):
                 # 0009: the eviction copy drained; release the held
                 # blocks back to the pool (durable or not).
                 held = getattr(self, "_eviction_job_blocks", {}).pop(job_id, [])
@@ -2194,7 +2329,14 @@ class OffloadingConnectorScheduler:
                     self._block_pool.return_held_blocks(
                         [self._block_pool.blocks[bid] for bid in held]
                     )
-                self._remove_pending_job(job_id, job_status.fenced_block_ids)
+                # 0012: in-place idle-flush copies are fenced blocks that
+                # can be REALLOCATED while the copy runs; the allocation
+                # flush path then consumes their _block_id_to_pending_jobs
+                # entry. Guarded per-block removal: completion must never
+                # KeyError on an already-flushed fence.
+                for bid in job_status.fenced_block_ids or ():
+                    if bid in self._block_id_to_pending_jobs:
+                        self._remove_pending_job(job_id, [bid])
                 del self._jobs[job_id]
                 continue
             req_status = self._req_status[job_status.req_id]
