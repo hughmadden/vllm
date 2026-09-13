@@ -1431,23 +1431,30 @@ class OffloadingConnectorScheduler:
         self,
         req_status: RequestOffloadState,
         num_offloadable_tokens: int,
-        offered: set[OffloadKey],
+        pending: set[OffloadKey],
         accepted: set[OffloadKey],
     ) -> None:
-        """Advance only through stable, acknowledged or skipped keys.
+        """Advance through stable keys; never seal pending ones.
 
         ``storable_chunks`` supplies the same per-group upper bound that
         ``advance_stored_idx`` uses, so the EAGLE/MTP volatile tail is excluded
-        here too. The walk stops at the first key that was offered to the
-        manager and neither admitted nor explicitly skipped: that key is still
-        retryable and must not be jumped over.
+        here too. The walk stops at the first PENDING key: one the manager
+        declined (retryable pressure) or an unmaterialized EAGLE row while the
+        request is running (draft KV lands a step later). Both become
+        storeable on a later pass and must be re-offered, not jumped over --
+        jumping sealed every chunk past the first offered slice of each
+        request (the tier then held ~5 objects/session and the lookup hit
+        boundary never advanced). Permanently filtered keys (reachability
+        masks, recycled/null rows outside the pending classification, rows
+        still null at request finish) advance normally: re-offering them is
+        futile and would hold the finished-request drain open forever.
         """
         for config, state in zip(self.config.kv_group_configs, req_status.group_states):
             end = req_status.storable_chunks(config, state, num_offloadable_tokens)
             frontier = state.next_stored_chunk_idx
             for idx in range(frontier, end):
                 key = state.offload_keys[idx]
-                if key in offered and key not in accepted:
+                if key in pending and key not in accepted:
                     break
                 frontier = idx + 1
             state.next_stored_chunk_idx = frontier
@@ -1535,6 +1542,13 @@ class OffloadingConnectorScheduler:
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
             group_store_ranges: list[tuple[int, int]] = []
+            # Candidates that must be re-offered on a later pass, not
+            # jumped over: rows the manager declines (retryable) and
+            # unmaterialized EAGLE rows while the request is running
+            # (draft KV lands a step later). Everything else filtered
+            # (reachability masks, recycled/null rows at finish) is
+            # permanent and advances normally.
+            pending_offload_keys: set[OffloadKey] = set()
 
             reachable_boundaries: tuple[int, ...] = ()
             if self.config.retention_interval is not None:
@@ -1631,6 +1645,9 @@ class OffloadingConnectorScheduler:
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
+                        if group_config.is_eagle_group and not req.is_finished():
+                            # Draft KV materializes a step later; re-offer.
+                            pending_offload_keys.add(offload_key)
                         continue
                     abs_chunk_idx = start_chunk_idx + key_idx
                     if (
@@ -1658,7 +1675,8 @@ class OffloadingConnectorScheduler:
 
             if not new_offload_keys:
                 self._advance_store_frontiers(
-                    req_status, num_offloadable_tokens, set(), set()
+                    req_status, num_offloadable_tokens,
+                    pending_offload_keys, set()
                 )
                 continue
 
@@ -1673,11 +1691,15 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
+                accepted = set(store_output.skipped_keys)
+                pending_offload_keys.update(
+                    set(new_offload_keys) - accepted
+                )
                 self._advance_store_frontiers(
                     req_status,
                     num_offloadable_tokens,
-                    set(new_offload_keys),
-                    set(store_output.skipped_keys),
+                    pending_offload_keys,
+                    accepted,
                 )
                 continue
 
@@ -1731,11 +1753,15 @@ class OffloadingConnectorScheduler:
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)
 
+            accepted = keys_to_store | set(store_output.skipped_keys)
+            pending_offload_keys.update(
+                set(new_offload_keys) - accepted
+            )
             self._advance_store_frontiers(
                 req_status,
                 num_offloadable_tokens,
-                set(new_offload_keys),
-                keys_to_store | set(store_output.skipped_keys),
+                pending_offload_keys,
+                accepted,
             )
 
             src_spec = GPULoadStoreSpec(
