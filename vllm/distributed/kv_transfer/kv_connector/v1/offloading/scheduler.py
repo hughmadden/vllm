@@ -81,6 +81,8 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
+    failed: bool = False
+    failed_load_blocks: set[int] = field(default_factory=set)
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -365,6 +367,8 @@ class RequestOffloadState:
     partial_tail_boundary: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # Set once an all-rank drained load for this request failed.
+    load_failed: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -1026,7 +1030,7 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        if request.skip_reading_prefix_cache or req_status.load_failed:
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
@@ -1418,6 +1422,31 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
+    def _advance_store_frontiers(
+        self,
+        req_status: RequestOffloadState,
+        num_offloadable_tokens: int,
+        offered: set[OffloadKey],
+        accepted: set[OffloadKey],
+    ) -> None:
+        """Advance only through stable, acknowledged or skipped keys.
+
+        ``storable_chunks`` supplies the same per-group upper bound that
+        ``advance_stored_idx`` uses, so the EAGLE/MTP volatile tail is excluded
+        here too. The walk stops at the first key that was offered to the
+        manager and neither admitted nor explicitly skipped: that key is still
+        retryable and must not be jumped over.
+        """
+        for config, state in zip(self.config.kv_group_configs, req_status.group_states):
+            end = req_status.storable_chunks(config, state, num_offloadable_tokens)
+            frontier = state.next_stored_chunk_idx
+            for idx in range(frontier, end):
+                key = state.offload_keys[idx]
+                if key in offered and key not in accepted:
+                    break
+                frontier = idx + 1
+            state.next_stored_chunk_idx = frontier
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1577,7 +1606,9 @@ class OffloadingConnectorScheduler:
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                self._advance_store_frontiers(
+                    req_status, num_offloadable_tokens, set(), set()
+                )
                 continue
 
             store_output = self.manager.prepare_store(
@@ -1591,7 +1622,12 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                self._advance_store_frontiers(
+                    req_status,
+                    num_offloadable_tokens,
+                    set(new_offload_keys),
+                    set(store_output.skipped_keys),
+                )
                 continue
 
             self._touch(req_status)
@@ -1643,9 +1679,13 @@ class OffloadingConnectorScheduler:
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)
-                group_state.next_stored_chunk_idx = max(
-                    group_state.next_stored_chunk_idx, num_chunks
-                )
+
+            self._advance_store_frontiers(
+                req_status,
+                num_offloadable_tokens,
+                set(new_offload_keys),
+                keys_to_store | set(store_output.skipped_keys),
+            )
 
             src_spec = GPULoadStoreSpec(
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
@@ -1811,7 +1851,14 @@ class OffloadingConnectorScheduler:
                     self._stale_job_threshold,
                 )
                 continue
-            job_status = self._jobs[job_id]
+            job_status = self._jobs.get(job_id)
+            if job_status is None:
+                # A duplicate late outcome must not resurrect a retired job.
+                continue
+            job_status.failed |= job_id in meta.failed_jobs
+            job_status.failed_load_blocks.update(
+                meta.failed_load_blocks.get(job_id, ())
+            )
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue
@@ -1819,9 +1866,54 @@ class OffloadingConnectorScheduler:
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                self.manager.complete_store(
+                    job_status.keys,
+                    req_status.req_context,
+                    success=not job_status.failed,
+                )
+                if job_status.failed:
+                    # Retry failed admissions while the original rows remain
+                    # valid; native stale-SWA filtering still runs before store.
+                    blocks_per_chunk = self.config.blocks_per_chunk
+                    for config, state in zip(
+                        self.config.kv_group_configs, req_status.group_states
+                    ):
+                        for idx, key in enumerate(state.offload_keys):
+                            if key not in job_status.keys:
+                                continue
+                            if config.sliding_window_size_in_chunks is not None:
+                                # Rows behind the old frontier were not covered
+                                # by stale-SWA filtering while this job ran.
+                                # They may already belong to another request;
+                                # never re-read them just because a store failed.
+                                for pos in range(
+                                    idx * blocks_per_chunk,
+                                    (idx + 1) * blocks_per_chunk,
+                                ):
+                                    if pos < len(state.block_ids):
+                                        state.block_ids[pos] = 0
+                            state.next_stored_chunk_idx = min(
+                                state.next_stored_chunk_idx, idx
+                            )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                if job_status.failed:
+                    req_status.load_failed = True
+                    for state in req_status.group_states:
+                        # Prefix-hit cursors were optimistic until the load
+                        # drained. Recomputed chunks must be eligible again.
+                        state.next_stored_chunk_idx = 0
+                    self.manager.on_load_failure(
+                        job_status.keys, req_status.req_context
+                    )
+                    if connector_output.invalid_block_ids is None:
+                        connector_output.invalid_block_ids = set()
+                    connector_output.invalid_block_ids.update(
+                        job_status.failed_load_blocks
+                    )
+                if connector_output.finished_recving is None:
+                    connector_output.finished_recving = set()
+                connector_output.finished_recving.add(job_status.req_id)
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
@@ -1909,8 +2001,10 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
-    def reset_cache(self) -> None:
-        """Reset the offloading manager cache, evicting all stored chunks."""
+    def reset_cache(self) -> bool:
+        """Reset only at quiescence; callers may retry after idle drain."""
+        if self._jobs or self.manager.has_pending_work():
+            return False
 
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
@@ -1949,6 +2043,7 @@ class OffloadingConnectorScheduler:
         # The load flush IDs collected above must be delivered to workers.
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
+        return True
 
     def shutdown(self) -> None:
         self.manager.shutdown()

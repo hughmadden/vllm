@@ -30,6 +30,7 @@ from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     OffloadingSpec,
     OffloadingWorker,
+    TransferResult,
 )
 
 logger = init_logger(__name__)
@@ -55,6 +56,9 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        self._load_block_ids: dict[int, set[int]] = {}
+        self._active_jobs: set[int] = set()
+        self._failed_submissions: list[TransferResult] = []
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -205,6 +209,32 @@ class OffloadingConnectorWorker:
 
         self._init_worker(canonical_kv_caches)
 
+    def _drain_failed_submission(self, job_id: int) -> None:
+        # Submission may have issued a partial copy before failing. Never
+        # release ownership unless wait has drained that work. A drain
+        # exception is intentionally fatal, not a recoverable cache miss.
+        assert self.worker is not None
+        self.worker.wait({job_id})
+        self._failed_submissions.append(TransferResult(job_id, False))
+
+    def _submit_store(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> None:
+        assert self.worker is not None
+        assert isinstance(src_spec, GPULoadStoreSpec)
+        self._active_jobs.add(job_id)
+        if not self.worker.submit_store(job_id, src_spec, dst_spec):
+            self._drain_failed_submission(job_id)
+
+    def _submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> None:
+        assert self.worker is not None
+        assert isinstance(dst_spec, GPULoadStoreSpec)
+        self._active_jobs.add(job_id)
+        if not self.worker.submit_load(job_id, src_spec, dst_spec):
+            self._drain_failed_submission(job_id)
+
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
 
@@ -224,9 +254,7 @@ class OffloadingConnectorWorker:
 
         # Submit deferred stores from previous step (and jobs_to_flush above).
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            self._submit_store(job_id, src_spec, dst_spec)
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
@@ -235,15 +263,16 @@ class OffloadingConnectorWorker:
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
+            self._submit_store(job_id, src_spec, dst_spec)
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
-            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
-            assert success
+            self._load_block_ids[job_id] = {
+                int(bid) for bid in entry.dst_spec.block_ids if bid != 0
+            }
+            self._submit_load(job_id, entry.src_spec, entry.dst_spec)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -265,16 +294,20 @@ class OffloadingConnectorWorker:
             tuple of (finished_sending, finished_recving). Stores never
             emit finished_sending — the scheduler tracks store completion
             via kv_connector_worker_meta.completed_jobs and fences any
-            block reuse via jobs_to_flush. Loads still emit
-            finished_recving so the base scheduler can resume requests
-            blocked on remote KV (and free aborted-during-load reqs).
+            block reuse via jobs_to_flush. Load outcomes are reduced by the
+            connector scheduler before it emits finished_recving, including
+            for requests aborted while remote KV was in flight.
         """
         assert self.worker is not None
-        finished_recving: set[str] = set()
-        for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
+        # Failed submissions take precedence over any worker completion for
+        # the same ID. Active membership makes late/duplicate outcomes inert.
+        results = self._failed_submissions + self.worker.get_finished()
+        self._failed_submissions = []
+        for transfer_result in results:
             job_id = transfer_result.job_id
-            assert transfer_result.success
+            if job_id not in self._active_jobs:
+                continue
+            self._active_jobs.remove(job_id)
             is_load = job_id in self._load_jobs
             if (
                 transfer_result.transfer_time is not None
@@ -289,12 +322,15 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
-            req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
-                finished_recving.add(req_id)
+            self._connector_worker_meta.mark_completed(job_id, transfer_result.success)
+            self._load_jobs.pop(job_id, None)
+            blocks = self._load_block_ids.pop(job_id, set())
+            if is_load and not transfer_result.success:
+                self._connector_worker_meta.failed_load_blocks[job_id] = blocks
 
-        return set(), finished_recving
+        # Only the scheduler knows when ALL ranks have drained a load. It
+        # publishes both finished_recving and invalid blocks at that boundary.
+        return set(), set()
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -305,8 +341,15 @@ class OffloadingConnectorWorker:
         return meta
 
     def shutdown(self) -> None:
-        self._unsubmitted_store_jobs.clear()
-        self._load_jobs.clear()
-        self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
+            for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+                self._submit_store(job_id, src_spec, dst_spec)
+            self._unsubmitted_store_jobs.clear()
+            self.worker.wait(self._active_jobs)
             self.worker.shutdown()
+        self._unsubmitted_store_jobs.clear()
+        self._active_jobs.clear()
+        self._load_jobs.clear()
+        self._load_block_ids.clear()
+        self._failed_submissions.clear()
+        self._connector_worker_meta = OffloadingWorkerMetadata()
