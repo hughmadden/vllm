@@ -202,6 +202,7 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 gqa_interleaved_layout=False,
                 overlap_input_projections=envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
                 reduce_results=not self.defer_hc_reductions,
+                prefill_checkpoint_blocks=int(envs.VLLM_QWEN3_8_PREFILL_COALESCE),
             )
         elif layer_type == "full_attention":
             if getattr(config, "indexer_n_heads", None) is None:
