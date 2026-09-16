@@ -340,6 +340,7 @@ def test_mtp_compaction_preserves_attention_rows_and_selected_outputs(indices):
         model_module.Qwen3_8FlashNextDecoderLayer
     )
     nn.Module.__init__(layer)
+    layer.defer_hc_reductions = False
     layer.ple = None
     layer.layer_type = "full_attention"
     rows = {}
