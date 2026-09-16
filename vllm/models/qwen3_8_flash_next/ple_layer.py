@@ -1281,11 +1281,31 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 self._num_seqs.fill_(1)
                 self._num_tokens.fill_(token_count)
 
+            checkpoint_offsets = torch.zeros_like(
+                self._state_slot_ids, dtype=torch.int32
+            )
+            checkpoint_slots = torch.full_like(self._state_slot_ids, NULL_BLOCK_ID)
+
+            def run():
+                result = state.run(binding, eps=self.eps, token_count=token_count)
+                if envs.VLLM_QWEN3_8_PREFILL_COALESCE:
+                    # Capture can invoke export even when no request checkpoints.
+                    # Prime its module with inactive slots before resolution freezes.
+                    state.export_checkpoint(
+                        binding, checkpoint_offsets, checkpoint_slots
+                    )
+                return result
+
             return PreparedCall(
-                run=lambda: state.run(binding, eps=self.eps, token_count=token_count),
+                run=run,
                 reset=reset,
                 restore=restore,
-                owners=(scratch, original_conv_state),
+                owners=(
+                    scratch,
+                    original_conv_state,
+                    checkpoint_offsets,
+                    checkpoint_slots,
+                ),
             )
 
         return prepare
