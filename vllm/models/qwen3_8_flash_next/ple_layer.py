@@ -1284,7 +1284,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             checkpoint_offsets = torch.zeros_like(
                 self._state_slot_ids, dtype=torch.int32
             )
-            checkpoint_slots = torch.full_like(self._state_slot_ids, NULL_BLOCK_ID)
+            checkpoint_slots = torch.full_like(self._state_slot_ids, -1)
 
             def run():
                 result = state.run(binding, eps=self.eps, token_count=token_count)
