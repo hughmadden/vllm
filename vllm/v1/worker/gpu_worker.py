@@ -82,6 +82,10 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.native_target import (
+    NativeTargetRunner,
+    get_native_target_binding,
+)
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -346,6 +350,12 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        if binding := get_native_target_binding(self.vllm_config):
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.model_runner = NativeTargetRunner(
+                self.vllm_config, self.device, binding
+            )
+            return
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -483,6 +493,9 @@ class Worker(WorkerBase):
         return self.worker_sentinel.handle_command(ft_request)
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if isinstance(self.model_runner, NativeTargetRunner):
+            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+            return
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -561,6 +574,10 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profile model memory through the ordinary vLLM admission path."""
+        if isinstance(self.model_runner, NativeTargetRunner):
+            raise RuntimeError(
+                "use native_cache_info; native bank is already allocated"
+            )
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
@@ -751,7 +768,23 @@ class Worker(WorkerBase):
         return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        if isinstance(self.model_runner, NativeTargetRunner):
+            raise RuntimeError("native target delegates physical cache allocation")
         return self.model_runner.get_kv_cache_spec()
+
+    def native_cache_info(self):
+        return self.model_runner.cache_info()
+
+    def native_admit(self, slot: int, request_id: int):
+        return self.model_runner.admit(slot, request_id)
+
+    def native_release(self, request):
+        self.model_runner.release(request)
+        return self.model_runner.cache_info()
+
+    def native_cancel_step(self):
+        self.model_runner.cancel_step()
+        return self.model_runner.cache_info()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to GPU memory."""
@@ -765,6 +798,8 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        if isinstance(self.model_runner, NativeTargetRunner):
+            raise RuntimeError("native bank is already allocated; no second KV cache")
 
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
@@ -1173,6 +1208,8 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if isinstance(self.model_runner, NativeTargetRunner):
+            return self.model_runner.sample_tokens(grammar_output)
         return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
@@ -1220,6 +1257,8 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if isinstance(self.model_runner, NativeTargetRunner):
+            return self.model_runner.execute_model(scheduler_output)
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1530,6 +1569,9 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        if isinstance(getattr(self, "model_runner", None), NativeTargetRunner):
+            self.model_runner.shutdown()
+            return
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

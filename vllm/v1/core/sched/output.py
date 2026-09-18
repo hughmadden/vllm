@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
 from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
+from vllm.v1.worker.native_target import NativeSchedule
 
 if TYPE_CHECKING:
     import numpy as np
@@ -308,6 +309,9 @@ class SchedulerOutput:
     compute_timing_enabled: bool = False
     compute_contention: bool = False
     compute_service_tokens: int = 0
+
+    # Native grants own tokens and generation-bearing leases, never block IDs.
+    native_target: "NativeSchedule | None" = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

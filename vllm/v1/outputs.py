@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.native_target import NativeStepResult
 
 if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata
@@ -382,6 +383,9 @@ class ModelRunnerOutput:
     # Per request: completed prompt, response, and leading-instruction
     # checkpoint token counts, or 0.
     boundary_checkpoint_tokens: list[list[int]] | None = None
+
+    # Published only after sampling consumers drain and actual native commit.
+    native_target: "NativeStepResult | None" = None
 
     @staticmethod
     def with_kv_conn_output_only(

@@ -92,6 +92,10 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
+from vllm.v1.worker.native_target import (
+    get_native_target_binding,
+    initialize_native_scheduler,
+)
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -131,6 +135,8 @@ class EngineCore:
         self._weight_version = "default"
 
         # Setup Model.
+        # Reject incomplete native selection before any worker/model allocation.
+        get_native_target_binding(vllm_config)
         self.model_executor = executor_class(vllm_config)
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
@@ -141,33 +147,8 @@ class EngineCore:
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
 
-        # Setup KV Caches and update CacheConfig after profiling.
-        with self.model_executor.b12x_warmup_control():
-            kv_cache_config = self._initialize_kv_caches(vllm_config)
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
-
-        # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
-
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-            kv_cache_config, vllm_config
-        )
-
-        self.scheduler: SchedulerInterface = Scheduler(
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=self.structured_output_manager,
-            include_finished_set=include_finished_set,
-            log_stats=self.log_stats,
-            block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
+        hash_block_size = self._initialize_cache_and_scheduler(
+            vllm_config, include_finished_set
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -259,6 +240,49 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    def _initialize_cache_and_scheduler(
+        self, vllm_config: VllmConfig, include_finished_set: bool
+    ) -> int:
+        if binding := get_native_target_binding(vllm_config):
+            try:
+                self.structured_output_manager = StructuredOutputManager(vllm_config)
+            except BaseException:
+                self.model_executor.shutdown()
+                raise
+            self.scheduler = initialize_native_scheduler(
+                binding,
+                vllm_config,
+                self.model_executor,
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=include_finished_set,
+                log_stats=self.log_stats,
+            )
+            # Native source references are not complete model prefix hits.
+            return 0
+
+        # Ordinary allocator and scheduler retain their existing initialization.
+        with self.model_executor.b12x_warmup_control():
+            kv_cache_config = self._initialize_kv_caches(vllm_config)
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
+            if vllm_config.scheduler_config.enable_chunked_prefill:
+                logger.warning("Disabling chunked prefill for model without KVCache")
+                vllm_config.scheduler_config.enable_chunked_prefill = False
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        self.scheduler: SchedulerInterface = Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=include_finished_set,
+            log_stats=self.log_stats,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+        )
+        return hash_block_size
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
