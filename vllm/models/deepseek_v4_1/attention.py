@@ -338,7 +338,7 @@ def _prepare_global_kv(
     context.no_compile_layers[prefix]._prepare_global_kv(positions, hidden)
     # A small explicit data dependency orders the following opaque attention
     # call without asking functionalization to clone the aliased KV pool.
-    return torch.empty(1, dtype=torch.uint8, device=hidden.device)
+    return torch.zeros(1, dtype=torch.uint8, device=hidden.device)
 
 
 @_prepare_global_kv.register_fake

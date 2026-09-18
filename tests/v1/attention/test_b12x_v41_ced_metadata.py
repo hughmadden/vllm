@@ -38,6 +38,23 @@ def test_short_continuation_does_not_replay_old_rows():
     assert plan.num_tokens == 129
 
 
+def test_encoder_only_ced_does_not_project_or_generate_drafts():
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    state = SimpleNamespace(
+        num_query_per_req=4, max_model_len=32768,
+        model_state=SimpleNamespace(get_ced_indices=lambda: torch.empty(0)),
+        draft_tokens=torch.full((4, 3), 42, dtype=torch.int64),
+    )
+    batch = SimpleNamespace(num_reqs=1, num_tokens=512,
+                            seq_lens_cpu_upper_bound=torch.tensor([512]))
+    drafts = DFlashSpeculator.propose(
+        state, batch, None, None, None, None, None, None, None, None, None, None
+    )
+    assert drafts.shape == (1, 0)
+    assert torch.all(state.draft_tokens == 42)
+
+
 def _state(lengths, seq_lens=None, full=None, prefix=None):
     lengths = np.asarray(lengths, dtype=np.int32)
     nr = len(lengths)
@@ -48,6 +65,39 @@ def _state(lengths, seq_lens=None, full=None, prefix=None):
     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
     state.stage(starts, seq, lengths, full or [False] * nr, prefix or [0] * nr)
     return state, starts, seq
+
+
+@cuda
+@pytest.mark.parametrize("tail", [1, 7, 64, 127, 128, 129, 256])
+def test_final_window_is_identical_across_scheduler_chunk_boundaries(tail):
+    """The final 128 prompt rows are emitted once, with one attention floor."""
+    prompt_end = 512 + tail
+    window_start = prompt_end - 128
+    state, starts, seq = _state([512])
+    emitted = []
+    for begin, end in ((0, 512), (512, prompt_end)):
+        query = end - begin
+        starts.copy_(torch.tensor([0, query], dtype=torch.int32, device="cuda"))
+        seq.fill_(end)
+        state.stage(
+            starts,
+            seq,
+            [query],
+            [False],
+            [0],
+            window_starts=[window_start],
+            query_ends=[end],
+        )
+        indices = state.get_indices()
+        selected = list(range(query)) if indices is None else indices.tolist()
+        expected_positions = list(range(max(begin, window_start), end))
+        assert selected == [position - begin for position in expected_positions]
+        assert state.replay_start[0].item() == window_start
+        assert state.request_positions[0].item() == end - len(selected)
+        assert state.starts[:2].tolist() == [0, len(selected)]
+        assert state.counts.tolist() == [len(selected), 1]
+        emitted.extend(begin + index for index in selected)
+    assert emitted == list(range(window_start, prompt_end))
 
 
 @cuda
@@ -126,12 +176,15 @@ def test_prompt_logprobs_zero_keeps_every_prompt_row(monkeypatch):
     state.ced_state, starts, seq = _state([4096, 4096])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_streaming_requests = set()
     batch = SimpleNamespace(
         num_reqs=2,
         req_ids=["logprobs", "ordinary"],
         query_start_loc=starts,
         seq_lens=seq,
         num_scheduled_tokens=np.array([4096, 4096]),
+        prefill_len_np=np.array([4096, 4096]),
+        num_computed_prefill_tokens_np=np.array([0, 0]),
     )
     state.add_request(
         0,
@@ -440,12 +493,15 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.ced_state, starts, seq = _state([1], [1025])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {"stream": 256}
+    state._ced_streaming_requests = set()
     batch = SimpleNamespace(
         num_reqs=1,
         req_ids=["stream"],
         query_start_loc=starts,
         seq_lens=seq,
         num_scheduled_tokens=np.array([1]),
+        prefill_len_np=np.array([1025]),
+        num_computed_prefill_tokens_np=np.array([1024]),
     )
     updated = SimpleNamespace(
         req_id="stream", num_computed_tokens=1024, sampling_params=None
@@ -455,11 +511,14 @@ def test_streaming_update_preserves_private_decoder_history(monkeypatch):
     state.add_request(0, updated)
     state._stage_ced(batch)
     assert state.ced_state.replay_start[0].item() == 256
+    assert state._ced_streaming_requests == {"stream"}
+    assert state._ced_streaming_prefix_start is None
     # A genuinely new incarnation must not retain that older history bound.
     state.remove_request("stream")
     state.add_request(0, updated)
     state._stage_ced(batch)
     assert state.ced_state.replay_start[0].item() == 1024
+    assert not state._ced_streaming_requests
 
 
 @cuda
@@ -474,6 +533,7 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
     state.ced_state, starts, seq = _state([256])
     state._ced_prompt_logprobs = set()
     state._ced_prefix_start = {}
+    state._ced_streaming_requests = set()
     state.lookback_token_ids = None
     state.disk_engram_models = ()
     state.device = torch.device("cuda")
@@ -484,6 +544,8 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
         query_start_loc=starts,
         seq_lens=seq,
         num_scheduled_tokens=np.array([256]),
+        prefill_len_np=np.array([256]),
+        num_computed_prefill_tokens_np=np.array([0]),
     )
     state.prepare_attn(batch, CUDAGraphMode.FULL, (), None, [], None, True)
     source = torch.ones((256, 2), device="cuda")
@@ -499,6 +561,7 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
         starts.copy_(torch.tensor([0, 2], dtype=torch.int32, device="cuda"))
         seq.fill_(2)
         batch.num_scheduled_tokens[:] = 2
+        batch.prefill_len_np[:] = 2
         state._stage_ced(batch)
         source.fill_(3)
         graph.replay()

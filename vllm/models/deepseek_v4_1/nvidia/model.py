@@ -259,6 +259,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             # Decoder global KV needs every encoder row, but decoder queries,
             # residual updates and experts only need the selected replay rows.
             global_kv_ready = self.attn.prepare_global_kv(positions, x)
+            if ced_indices.numel() == 0:
+                # Encoder-only chunk. Keep source production in the output's
+                # dependency chain, and do not enter zero-row native kernels.
+                x = torch.zeros_like(x) + global_kv_ready.to(x.dtype)
+                return x, residual, post_mix, res_mix, attn_pre
             x = gather_rows(x, ced_indices)
             residual = gather_rows(residual, ced_indices)
             post_mix = gather_rows(post_mix, ced_indices)
@@ -599,6 +604,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ced_indices=boundary_indices,
             )
             if boundary_indices is not None:
+                if boundary_indices.numel() == 0:
+                    # No decoder rows in this chunk. Preserve runner/draft ABI;
+                    # no output from these prompt positions will be sampled.
+                    if self._mtp_hidden_buffer is not None:
+                        self._mtp_hidden_buffer[:full_num_tokens].zero_()
+                    if not get_pp_group().is_last_rank:
+                        return IntermediateTensors({
+                            "hidden_states": hidden_states[:, None, :].expand(
+                                -1, self.hc_mult, -1
+                            ).contiguous(),
+                            "pre_mix": torch.zeros_like(pre_mix),
+                        })
+                    for aux_layer in self.aux_hidden_state_layers:
+                        if idx < aux_layer <= self.end_layer:
+                            aux_hidden_states.append(hidden_states.clone())
+                    return ((hidden_states, aux_hidden_states)
+                            if aux_hidden_states else hidden_states)
                 positions = gather_rows(positions, ced_indices)
                 if input_ids is not None:
                     input_ids = gather_rows(input_ids, ced_indices)

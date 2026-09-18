@@ -1741,6 +1741,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_cudagraph_query_len = getattr(
             self.model_state, "max_cudagraph_query_len", None
         )
+        # Prompt-wide CED may select zero/partial rows in any prefill chunk.
+        # Decode graphs keep their full-row ABI and remain reusable.
+        if (getattr(self.model_state, "final_window_ced", False)
+                and batch_req_state is not None and batch_req_state.has_prefill):
+            skip_compiled = True
         exceeds_cudagraph_query_len = (
             max_cudagraph_query_len is not None
             and max_query_len > max_cudagraph_query_len

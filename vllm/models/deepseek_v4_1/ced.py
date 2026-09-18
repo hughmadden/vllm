@@ -138,10 +138,19 @@ class CEDPlan:
     keep_full: tuple[bool, ...]
 
 
-def plan_ced(query_lengths, keep_full, capacities: tuple[int, ...]) -> CEDPlan | None:
+def plan_ced(query_lengths, keep_full, capacities: tuple[int, ...],
+             window_starts=None, query_ends=None) -> CEDPlan | None:
+    if window_starts is None:
+        window_starts = [-1] * len(query_lengths)
+        query_ends = [0] * len(query_lengths)
     kept = tuple(
-        int(q) if full else min(int(q), CED_WINDOW)
-        for q, full in zip(query_lengths, keep_full)
+        int(q) if full else (
+            min(int(q), max(int(end) - int(start), 0))
+            if start >= 0 else min(int(q), CED_WINDOW)
+        )
+        for q, full, start, end in zip(
+            query_lengths, keep_full, window_starts, query_ends
+        )
     )
     if all(k == int(q) for k, q in zip(kept, query_lengths)):
         return None
@@ -168,6 +177,7 @@ def _decoder_requests(
     R: tl.constexpr,
     B: tl.constexpr,
     WINDOW: tl.constexpr,
+    WindowStart=None,
 ):
     r = tl.arange(0, B)
     valid = r < nr
@@ -177,6 +187,13 @@ def _decoder_requests(
     full = tl.load(KeepFull + r, valid, other=0)
     q = end - start
     kept = tl.where(full, q, tl.minimum(q, WINDOW))
+    window = tl.full((B,), -1, tl.int64)
+    if WindowStart is not None:
+        window = tl.load(WindowStart + r, valid, other=-1)
+        kept = tl.where(
+            (window >= 0) & ~full,
+            tl.minimum(q, tl.maximum(seq - window, 0)), kept,
+        ).to(tl.int32)
     cumulative = tl.cumsum(kept)
     count = tl.sum(kept)
     tl.store(OutStarts + r, tl.where(valid, cumulative - kept, count), r <= R)
@@ -184,6 +201,7 @@ def _decoder_requests(
     tl.store(RequestPositions + r, tl.where(valid, seq - kept, -1), r < R)
     prefix = tl.load(PrefixStart + r, valid, other=0)
     replay = tl.maximum(prefix, tl.where(q > kept, seq - kept, 0))
+    replay = tl.where((window >= 0) & ~full, tl.maximum(prefix, window), replay)
     tl.store(ReplayStart + r, replay, r < R)
     tl.store(Counts, count)
     tl.store(Counts + 1, nr)
@@ -228,6 +246,7 @@ class CEDState:
         self.counts = torch.empty(2, dtype=torch.int32, device=device)
         self.keep_full = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.prefix_start = torch.empty_like(self.request_positions)
+        self.window_start = torch.empty_like(self.request_positions)
         self.plan: CEDPlan | None = None
 
     def warmup(self, hidden_size: int, hc_mult: int) -> None:
@@ -263,9 +282,13 @@ class CEDState:
         query_lengths,
         keep_full,
         prefix_start,
+        window_starts=None,
+        query_ends=None,
     ) -> None:
         nr = len(query_lengths)
-        self.plan = plan_ced(query_lengths, keep_full, self.capacities)
+        self.plan = plan_ced(
+            query_lengths, keep_full, self.capacities, window_starts, query_ends
+        )
         # Fresh pinned sources remain owned by the async-copy allocator until
         # transfer completion; reusing a CPU staging buffer could race overlap.
         keep_host = torch.tensor(
@@ -276,6 +299,11 @@ class CEDState:
         )
         self.keep_full[:nr].copy_(keep_host, non_blocking=True)
         self.prefix_start[:nr].copy_(prefix_host, non_blocking=True)
+        window_host = torch.tensor(
+            [-1] * nr if window_starts is None else window_starts,
+            dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self.window_start[:nr].copy_(window_host, non_blocking=True)
         _decoder_requests[(1,)](
             starts,
             seq,
@@ -289,6 +317,7 @@ class CEDState:
             self.max_requests,
             triton.next_power_of_2(self.max_requests + 1),
             CED_WINDOW,
+            WindowStart=self.window_start,
         )
         if self.plan is not None:
             _decoder_indices[(triton.cdiv(self.plan.capacity, 128),)](

@@ -75,6 +75,8 @@ class DeepseekV41ModelState(DefaultModelState):
         self.ced_state: CEDState | None = None
         self._ced_prompt_logprobs: set[str] = set()
         self._ced_prefix_start: dict[str, int] = {}
+        self._ced_streaming_requests: set[str] = set()
+        self.final_window_ced = self.ced_state is not None
         self._ced_batch: InputBatch | None = None
         self.max_cudagraph_query_len: int | None = None
         if ced_decoder_start(self.model_config.hf_config) is not None:
@@ -102,6 +104,7 @@ class DeepseekV41ModelState(DefaultModelState):
             self.ced_state = CEDState(
                 self.max_num_reqs, self.max_num_tokens, capacities, device
             )
+            self.final_window_ced = True
             hf = self.model_config.hf_config
             self.ced_state.warmup(hf.hidden_size, hf.hc_mult)
             parallel = vllm_config.parallel_config
@@ -146,6 +149,10 @@ class DeepseekV41ModelState(DefaultModelState):
         # Fresh decoder pages lack cached history; streaming updates retain
         # the live request's private pages and therefore its original boundary.
         pending = self._ced_streaming_prefix_start
+        if pending is not None and pending[0] == new_req_data.req_id:
+            self._ced_streaming_requests.add(new_req_data.req_id)
+        else:
+            self._ced_streaming_requests.discard(new_req_data.req_id)
         prefix_start = (
             pending[1]
             if pending is not None and pending[0] == new_req_data.req_id
@@ -158,6 +165,7 @@ class DeepseekV41ModelState(DefaultModelState):
         super().remove_request(req_id)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
+        self._ced_streaming_requests.discard(req_id)
 
     def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
         return (
@@ -181,6 +189,15 @@ class DeepseekV41ModelState(DefaultModelState):
         if state is None:
             return
         nr = input_batch.num_reqs
+        # One prompt-wide suffix, even when it crosses scheduler chunks.
+        # Decode retains this bound; live streaming keeps its private history.
+        window_starts = [
+            -1 if force_full or req_id in self._ced_streaming_requests else max(
+                self._ced_prefix_start.get(req_id, 0),
+                int(input_batch.prefill_len_np[i]) - CED_WINDOW, 0,
+            )
+            for i, req_id in enumerate(input_batch.req_ids)
+        ]
         state.stage(
             input_batch.query_start_loc,
             input_batch.seq_lens,
@@ -195,6 +212,9 @@ class DeepseekV41ModelState(DefaultModelState):
             else [
                 self._ced_prefix_start.get(req_id, 0) for req_id in input_batch.req_ids
             ],
+            window_starts=window_starts,
+            query_ends=(input_batch.num_computed_prefill_tokens_np[:nr]
+                        + input_batch.num_scheduled_tokens[:nr]),
         )
         self._ced_batch = input_batch
 

@@ -403,6 +403,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_context_tokens = (
             num_target_tokens if ced_indices is None else ced_indices.numel()
         )
+        if num_context_tokens == 0:
+            # CED encoder-only chunks have no decoder context and cannot
+            # produce a sampled token yet. Do not project or draft empty rows.
+            return self.draft_tokens[:num_reqs, :0]
         if ced_indices is not None:
             from vllm.models.deepseek_v4_1.ced import gather_rows
 
