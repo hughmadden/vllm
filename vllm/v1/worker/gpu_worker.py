@@ -778,6 +778,9 @@ class Worker(WorkerBase):
     def native_admit(self, slot: int, request_id: int):
         return self.model_runner.admit(slot, request_id)
 
+    def native_can_prepare(self, work):
+        return self.model_runner.can_prepare(work)
+
     def native_release(self, request):
         self.model_runner.release(request)
         return self.model_runner.cache_info()

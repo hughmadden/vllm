@@ -1,144 +1,145 @@
 # Native target selection and worker lifecycle
 
-19 September 2026 AEST. This is a selectable engine/worker seam with CPU fake
-backend tests. It is off by default. A production target C ABI consumer,
-vLLM sampler adapter and native scheduler must register together before serving
-can start. This packet does not claim a vLLM GPU run, numerical parity or speed.
+19 September 2026 AEST. The default-disabled retained binding connects the native
+target C ABI, actual native cache bank, text scheduler and existing vLLM sampler.
+CPU tests exercise real vLLM request/output types and sampler behavior. This
+packet does not claim a vLLM GPU run, numerical parity or speed; those remain
+live qualification gates.
 
-The retained Rust API at `ce1e1cd83b57da24b5f18abd352002ef4fc53bcb`
-(`native_executor::target::with_target`) supplies the actual `Requests` /
-`BackboneCache` bank and two `TargetPass` contexts. The independent schema-1
-`CacheCommands` prototype must **never** be instantiated beside that bank.
-Its earlier cross-language tests qualify the metadata contract only.
+## Selection and dependencies
 
-## Actual selection points
+`additional_config.afd_native_target.enabled=true` selects this path.
+`implementation="retained"` lazily registers the built-in production binding in
+each process. No general plugin metadata or legacy `VLLM_AFD` transport hook is
+required. Alternate bindings can explicitly register before selection. An enabled
+selection without a binding rejects before executor construction.
 
-`additional_config={"afd_native_target": {"enabled": true}}` selects the path.
-A general plugin calls `register_native_target(binding)` in the engine and
-worker environments. The binding provides configuration validation, a sampler
-factory, one combined native constructor and a scheduler factory. Configuration
-validation must reject unsupported checkpoint/device/budget combinations before
-allocation. Without that registered binding, EngineCore rejects selection before
-constructing an executor; there is no fallback that loads ordinary weights.
+Use package client `dff621bd3ef760b1adc95405ba9a634419ab5d42`, including the
+Torch 2.14 CUDA array-interface correction; the actual
+native target C ABI begins at Rust `0dad275cc8fd2a2619203f861345d9cd835c8b91`.
+Compatible descendants may extend this interface. This binding
+uses the actual `NativeBank` / `TargetContext` ownership, never the independent
+schema-1 `CacheCommands` prototype. Its earlier cross-language tests concern
+metadata only and do not qualify the live physical bank.
 
-The initial supported integration scope is one `uni` worker with synchronous V2
-generation. Prefix caching, vLLM TP/PP/DP, async scheduling, speculation, LoRA,
-sleep, KV/EC connectors and weight transfer reject at selection. The model may
-have vision modules, but scheduled image inputs reject at execution. Only the
-`full_target` phase with prefill/decode source kinds is currently accepted.
+The API/tokenizer checkpoint and native checkpoint must represent the same
+DS4.1 Flash model. Dimensions are checked; checkpoint equivalence still requires
+the deployment manifest and token-ID comparison. Example `--additional-config`
+JSON, with example paths and addresses that must be replaced for deployment:
+
+```json
+{"afd_native_target": {
+  "enabled": true,
+  "implementation": "retained",
+  "abi_library": "/artifacts/libds41rt_daemon.so",
+  "snapshot": "/weights/native-ds41",
+  "native_lib": "/artifacts/libds41rt_native.so",
+  "peers": ["127.0.0.2:9200", "127.0.0.3:9200", "127.0.0.4:9200", "127.0.0.5:9200"],
+  "batch_tokens": 256,
+  "slots": 2,
+  "source_pool_budget_bytes": 536870912,
+  "timeout_s": 60,
+  "poll_interval_s": 0.00005
+}}
+```
+
+Select `VLLM_USE_V2_MODEL_RUNNER=1`,
+`--distributed-executor-backend uni`, `--no-async-scheduling`,
+`--no-enable-prefix-caching`, `--max-num-seqs 2`,
+`--max-num-batched-tokens 512`, a measured `--max-model-len`, and
+`--enable-prompt-tokens-details`. Keep the intended model/tokenizer metadata,
+served model name and chat template options. The 512 MiB example budgets native
+source payload, not all native memory. The legacy AFD plugin should be disabled.
+
+## Construction and physical ownership
 
 | Entry point | Selected native behavior |
 | --- | --- |
-| `Worker.init_device` | Constructs only `NativeTargetRunner` and a device descriptor before the ordinary distributed/workspace/V2 constructors. The binding owns CUDA initialization. |
-| `Worker.load_model` | Creates the sampler first, then calls the combined native constructor once. The ordinary PyTorch backbone loader is bypassed. |
-| Native constructor | Loads shared weights, both target/transport contexts and retained staging; runs native memory planning; allocates one actual bank; returns actual capacity. These are internal ordered stages of one call, not three separately callable APIs. Partial construction must unwind before returning an error. |
-| `EngineCore._initialize_cache_and_scheduler` | Reads `native_cache_info` via executor RPC, validates one native receipt, then calls the native scheduler factory. Ordinary KV specs, memory profiling, KV tensors and the scheduler `BlockPool` are bypassed. A failed receipt/scheduler initialization closes the worker. |
-| Ordinary worker cache methods | Explicitly reject when native is selected. No empty/fake KV tensor or fake physical block count is supplied. |
-| `Worker.execute_model` | Updates the sampler's vLLM request metadata, submits up to two disjoint grants before driving native execution, then retains both logits leases. |
-| `Worker.sample_tokens` | Invokes the supplied vLLM sampler, drains its GPU consumers, releases logits borrows, then commits only accepted rows through the actual native contexts. Returns a real `ModelRunnerOutput`. |
-| `native_cancel_step`, `native_release`, `shutdown` | Drain logits consumers before cancel/discard; release requests only when the step no longer owns them. Close does not reclaim a timed-out consumer lease. |
+| `Worker.init_device` | Creates `NativeTargetRunner` before ordinary distributed/workspace/V2 construction. |
+| `Worker.load_model` | Allocates the sampler first, retains the asynchronous native owner, then waits for its one combined initialization ACK. No PyTorch backbone loader runs. |
+| Native initialization | Loads shared weights and both contexts/transports/staging; plans and allocates one real `Requests` / `BackboneCache` bank. These are internal stages of one call. |
+| `EngineCore._initialize_cache_and_scheduler` | Reads one authoritative worker capacity receipt, creates `NativeScheduler`; bypasses ordinary KV specs, profiling, KV tensors and `BlockPool`. Failed initialization closes the worker. |
+| Ordinary worker KV methods | Reject selection; no fake KV tensors or physical block counts are supplied. |
+| `execute_model` | Updates sampling metadata, submits both disjoint grants before execution, retains result leases. |
+| `sample_tokens` | Runs vLLM sampling, drains CUDA consumers, releases native logits borrows, commits input rows and returns a real `ModelRunnerOutput`. |
+| Cancel/release/shutdown | Drain consumers before discard/reuse; retained commands and leases survive timeouts. |
 
-Sampler allocations precede native planning so they are visible to its memory
-calculation. `NativeCacheInfo.cache_bytes` is the native-reported actual cache
-allocation, including window storage. It is **not** interchangeable with the
-requested global source-pool budget. Weight/context/vision/transport/staging and
-sampling workspaces must also remain in the binding's complete device budget.
-This receipt does not report total model memory or establish that a larger
-configuration fits. The engine does not convert four independent native source
-pool credits into one ordinary vLLM `num_gpu_blocks` count.
+`NativeCacheInfo.cache_bytes` is actual native cache allocation including windows.
+It is not the requested `source_pool_budget_bytes` or total model memory. Shared
+weights, contexts, retained vision workspace, transport and sampler scratch also
+consume memory. The scheduler never converts four source pools into an ordinary
+vLLM `num_gpu_blocks` value.
 
-## Scheduler, request and sampling contract
+## Scheduler and sampling
 
-The worker exposes `native_admit(slot, numeric_request_id)`, returning the actual
-`{owner, slot, generation}` lease, and `native_release(lease)` returning refreshed
-native credits. The scheduler binding must implement `SchedulerInterface` using
-these operations and the native receipts. It can track logical admission and
-reservations; it must not create a second physical allocator. It must maintain
-the usual request completion, stop conditions, fairness and output handling.
+`NativeScheduler` queues requests, issues bounded full-target prefill/decode chunks
+to two disjoint contexts, uses upstream stop/max-token rules and returns ordinary
+`EngineCoreOutputs`. Existing tokenization, detokenization, text stops, API output
+processing, usage and logprob handling remain in vLLM. Initial prefill explicitly
+reports zero cached tokens. Reset/preemption releases the actual native request,
+re-admits a new generation and recomputes prompt plus emitted history without
+emitting the old history again.
 
-`SchedulerOutput.native_target` contains a `NativeSchedule(owner, step_id,
-grants)`; each immutable grant carries:
+Admission asks `native_can_prepare` about the aggregate remaining maximum token
+demand of all admitted requests plus the candidate. Before dispatch, both selected
+grants are checked together again. These operations delegate to the actual native
+append-capacity planner while both contexts are idle. One synchronous engine owns
+check/dispatch; these queries are not independently retained reservations. Python
+has no source-page formula or physical free list. Worst-case logical admission
+avoids exhausting a running request midway, but can reduce concurrency; measure
+that cost before changing the policy.
 
-- vLLM request ID and native request generation;
-- lane 0 or 1, expected native committed end;
-- exactly the granted owned token IDs and strictly increasing selected-logit rows;
-- prefill/decode source kind, expert placement identity and `full_target` phase.
+Each immutable grant carries request ID/generation, lane, expected committed end,
+owned token IDs, selected rows, prefill/decode kind and `full_target` phase. The
+runner checks step/owner, extents, disjointness and native committed end. All
+publication receipts and sampled row counts validate before scheduler mutation.
+The C ABI client owns correlated retry and timeout state. A lost reply resumes its
+original command; neither sampled steps nor native commits are blindly replayed.
+A native publication error poisons the scope and emits no model output, even if
+another request's earlier native commit already succeeded.
 
-The runner checks the token counts against `num_scheduled_tokens`, actual native
-capacity and actual `committed_end`. It rejects two lanes for the same request,
-finished/preempted requests, stale owners/steps, unsupported phases and more than
-48 selected rows per context (the current retained compact-head limit). Empty
-steps may update/retire sampler metadata and return an empty output receipt.
-The native backend must additionally enforce its checkpoint vocabulary, context
-length, generation and device extents; those are authoritative native checks.
+The sampler uses vLLM's existing `Sampler` and built-in processors, preserving
+parameters, output histories, per-request RNG, penalties, min tokens, logit bias,
+min-p, top-k/top-p and output logprobs. Native FP32 logits are semantically read-only;
+upstream sampling mutates logits, so the zero-copy CUDA view is copied into two
+reusable GPU scratch rows. No full-vocabulary D2H copy is added. Every request is
+sampled as a one-row batch independent of its lane partner. The client binds each
+lease to the current PyTorch CUDA stream. Native records/drains its completion
+event before commit or context reuse. Consumer timeout retains the borrow.
 
-`NativeSampler.update_requests(SchedulerOutput)` receives the existing new/cached
-request metadata and finished/preempted IDs. Its adapter must retain vLLM's
-sampling parameters, token histories, RNG, penalties, grammar and logprob
-semantics. `sample(grants, leases, grammar_output)` returns `NativeSample` with a
-real `ModelRunnerOutput` and an accepted input-row count per grant. No greedy
-native sampler is substituted. The sampler must register every GPU consumer on
-the lease even when it later raises; all consumers must drain before native
-publication or reuse. The initial C ABI consumer may constrain this to one
-explicit CUDA stream; a second stream requires its own retained event.
+Request preprocessing rejects unsupported modes before the scheduler's serving
+loop: images/embeddings, structured output, priority, prompt/full-vocabulary or
+specific-token logprobs, trace replay, recurrent checkpoints, custom extra args,
+thinking-token budgets and streaming input. Configuration rejects vLLM parallel
+workers, async scheduling, prefixes, speculation, LoRA, connectors, sleep, custom
+processors, routed-expert/sampling-mask outputs and ordinary KV memory budgets.
 
-`ModelRunnerOutput.native_target` carries the executor owner, step ID, actual
-committed ends and refreshed source credits, after all commits succeed. It is
-not the schema-1 ACK and does not introduce a second epoch ledger. A native
-publication error fails the scope and produces no model output, even if another
-request's earlier commit succeeded. The scheduler must retire that scope and
-recompute rather than infer rollback of a commit already acknowledged by native.
+Cancellation arriving during a synchronous step is processed after GPU completion
+and before output publication, following EngineCore's existing abort boundary.
+Worker calls serialize under a lock, preventing cancellation from freeing sampler
+storage. Responsive mid-kernel abort and asynchronous engine scheduling remain
+outside this first binding.
 
-The C ABI consumer is responsible for correlated command IDs, exact retry of a
-lost native reply and bounded completion polling. This runner does not retry an
-entire sampled step: it accepts strictly increasing step IDs and retains only
-the active step. A worker restart mints a new nonzero owner; the scheduler must
-discard every old request lease/receipt and re-admit from uncached tokens.
+## Remaining qualification
 
-Cancellation currently applies to the entire active worker step. After successful
-drain/discard, a scheduler may issue a new step for an unaffected request. Python
-calls serialize under an `RLock`; a concurrent cancel cannot free a sampler's
-borrow. Responsive cancellation during an in-flight native wait still belongs
-in the C ABI's owner-thread command loop. This is not proof of asynchronous
-engine scheduling or same-prompt two-chunk streaming.
+- Run GPU startup and strict C1/C2 numerical gates, including mixed request
+  histories and top-k/logprob invariance. Expert repeatability and standalone
+  native smoke results do not waive the complete vLLM gate.
+- Bind the native encoder-stream/final-replay facade for long fresh prefill;
+  consecutive full-target chunks are not that optimized execution schedule.
+  dSpark requires its own accepted-prefix transaction integration afterward.
+- Complete model checkpoint lifecycle before enabling prefix hits. Source pages
+  alone omit windows, compressor/Engram history and replay state.
+- Measure native memory, throughput and conservative admission's concurrency cost.
 
-## Remaining integration and qualification
+## CPU checks
 
-The following are still required before registering a production binding:
-
-1. Connect the actual native C ABI and its CUDA result leases to the backend
-   protocol, preserving pending command/lease ownership across timeouts.
-2. Implement the scheduler with actual native credits and acknowledgements,
-   including request admission/release and preemption/recompute, and adapt the
-   existing vLLM sampler without loading a PyTorch backbone. A factory object
-   that merely satisfies Python method names does not qualify serving.
-3. Bind full checkpoint lifecycle before advertising prefix hits: native source
-   pages alone omit windows, compressor/Engram history and replay state. Native
-   source prefix lookup must remain excluded from vLLM cache-hit reporting.
-4. Add explicit encoder-chunk token grants, predecessor publication fences,
-   retained suffix and final decoder replay before enabling streaming prefill.
-   A full-target call cannot stand in for encoder/replay execution. dSpark taps
-   and accepted-prefix transactions need their own binding afterward.
-5. Run the strict numerical gates on the completed vLLM path, including mixed
-   batch/request histories and C2 logprob/top-k invariance, then measure memory
-   and throughput. Existing expert repeatability or a standalone native target
-   smoke does not waive these gates.
-
-## CPU validation
-
-`tests/v1/worker/test_native_target.py` uses fake native completion/storage and
-the real output dataclass definitions. Hook tests execute the actual Worker and
-EngineCore entry method bodies with injected CPU dependencies; decorators are
-removed, and the full GPU modules are not imported. Ordinary initialization
-functions are deliberately absent in native hook tests, so reaching one fails.
-This catches selection ordering without pretending a torch-less host ran the
-GPU worker.
-
-Tests cover constructor counts/order, authoritative bank receipts, failed cache
-or scheduler initialization, both-lane submission, active-result reuse,
-concurrent cancellation, sampling failure after launch, consumer-drain timeout
-retention, zero/partial accepted publication, commit failure and invalid grants.
-The ordinary EngineCore initialization order is tested with native selection off.
+`tests/v1/worker/test_native_target.py` runs 31 fake-backend cases. It executes the
+actual Worker/EngineCore method bodies with CPU dependencies, tests constructor
+ordering/counts, cache failure, result ownership, cancellation, retained timeouts,
+publication errors and default-off behavior. Full GPU modules are not imported.
+Together with the prior cache adapter/Rust metadata contract suites, 58 tests pass
+without skips. Use the retained uv environment and explicit pytest paths:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 uv run --offline --no-project \
@@ -146,11 +147,18 @@ PYTHONDONTWRITEBYTECODE=1 uv run --offline --no-project \
   tests/v1/worker/test_native_target.py -q
 ```
 
-The native runner suite passes 29 cases; combined with the prior Python adapter
-and actual Rust command-contract suites, 56 cases pass with no skips.
+`tests/v1/worker/test_native_target_serving.py` passes 22 cases using stdlib
+`unittest` with real
+Torch and vLLM request/output/sampling modules in retained image
+`sha256:8041c897278b8372c15784d3a651c1cba689c24ccf6c12842ad3a7bf5b85abbe`.
+The CPU container has no GPU/network, a two-CPU/four-GiB limit and only source/uv
+mounts. Tests disable CUDA page locking and unwrap one compiled counting helper;
+sampler logic is upstream. They cover the integrated scheduler→runner→sampler
+loop, queue/credits, cached tokens zero, reset, cancellation, immutable logits,
+sampling parameters, seeded RNG and top-logprob invariance.
 
-No dependencies were installed. The retained Ruff executable provides scoped
-lint/format checks. Full pre-commit is unavailable in the retained offline
-environment; torch and msgspec are also absent, so full worker imports and IPC
-serialization are not qualified here. The selected initial `uni` path does not
-serialize scheduler/worker grants through a multiprocessing transport.
+No dependencies were installed. Retained Ruff supplies scoped lint/format checks;
+full pre-commit is unavailable offline. The local environment lacks Torch/msgspec,
+while the retained CPU container supplies both. These checks do not qualify live
+CUDA leases or full API/EngineCore IPC; the selected uni worker itself does not
+serialize grants through a second worker process.

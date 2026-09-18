@@ -113,6 +113,7 @@ class NativeTargetBackend(Protocol):
     def admit(self, slot: int, request_id: int) -> NativeRequest: ...
     def release(self, request: NativeRequest) -> None: ...
     def committed_end(self, request: NativeRequest) -> int: ...
+    def can_prepare(self, work: tuple[tuple[NativeRequest, int], ...]) -> bool: ...
     def submit(self, grant: NativeGrant) -> Any:
         """Own copied inputs and retain unresolved native commands on reply loss.
 
@@ -224,6 +225,10 @@ def get_native_target_binding(config: VllmConfig) -> NativeTargetBinding | None:
             "uni worker; prefixes, speculation, connectors, LoRA, sleep and parallel "
             "workers are not bound"
         )
+    if _binding is None and options.get("implementation") == "retained":
+        from vllm.v1.worker.native_target_binding import RetainedNativeBinding
+
+        register_native_target(RetainedNativeBinding())
     if _binding is None:
         raise NativeTargetUnavailable(
             "native target selected but no target/CUDA-lease/sampler/scheduler "
@@ -291,6 +296,10 @@ class NativeTargetRunner:
                 self._backend = self.binding.create_backend(
                     self.config, self.device, self.owner
                 )
+                # C ABI creation returns an owned thread immediately; retain it
+                # before waiting for its one combined load/plan/cache-init ACK.
+                if initialize := getattr(self._backend, "initialize", None):
+                    initialize()
                 self._backend.info().validate(self.owner)
                 self._loaded = True
             except BaseException:
@@ -324,6 +333,12 @@ class NativeTargetRunner:
                     "native request still active; cancel or sample first"
                 )
             backend.release(request)
+
+    def can_prepare(self, work):
+        with self._lock:
+            if self._active:
+                raise RuntimeError("native capacity query requires idle target lanes")
+            return self._ready().can_prepare(work)
 
     def _validate_schedule(self, output: SchedulerOutput) -> NativeSchedule:
         backend = self._ready()

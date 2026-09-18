@@ -1134,6 +1134,9 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if validator := getattr(self.scheduler, "validate_request", None):
+            # Admission errors stay on the request preprocessing error path.
+            validator(req)
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

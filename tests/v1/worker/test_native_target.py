@@ -307,6 +307,26 @@ def test_failed_step_drains_and_cancels_without_publication(binding, failure):
     runner.shutdown()
 
 
+def test_async_constructor_timeout_retains_owner_until_cleanup(binding):
+    closed = []
+
+    def construct(*args):
+        backend = binding.backend = Backend(17, binding.events)
+
+        def initialize():
+            raise TimeoutError("initial native ACK pending")
+
+        backend.initialize = initialize
+        backend.close = lambda: closed.append(backend)
+        return backend
+
+    binding.create_backend = construct
+    runner = native.NativeTargetRunner(config(), "cuda:0", binding, owner=17)
+    with pytest.raises(TimeoutError, match="ACK pending"):
+        runner.load_model()
+    assert closed == [binding.backend]
+
+
 def test_failed_consumer_drain_retains_leases_until_successful_shutdown(binding):
     runner = ready(binding)
     runner.execute_model(schedule(runner))
@@ -600,3 +620,25 @@ def test_engine_default_retains_ordinary_initialization_order(binding):
     )
     assert initialize(engine, cfg, False) == 256
     assert events == ["ordinary_cache", "structured", "scheduler"]
+
+
+def test_native_admission_validation_uses_request_error_boundary():
+    req = SimpleNamespace(use_structured_output=True)
+
+    def reject(request):
+        assert request is req
+        raise ValueError("structured native request unsupported")
+
+    engine = SimpleNamespace(
+        mm_receiver_cache=None,
+        request_block_hasher=None,
+        scheduler=SimpleNamespace(validate_request=reject),
+    )
+    preprocess = method(
+        "vllm/v1/engine/core.py",
+        "EngineCore",
+        "preprocess_add_request",
+        {"Request": SimpleNamespace(from_engine_core_request=lambda *a: req)},
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        preprocess(engine, SimpleNamespace(mm_features=None, current_wave=0))
