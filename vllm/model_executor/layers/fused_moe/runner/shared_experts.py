@@ -155,7 +155,12 @@ class SharedExperts(torch.nn.Module):
 
             # Mark sync start point for the aux stream since we will
             # run in parallel with router/gate.
-            self._stream.wait_stream(current_stream())
+            # A breakable capture can close this segment before shared work
+            # is submitted. Fork the aux stream only in its consuming segment.
+            from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+            if BreakableCUDAGraphCapture.current() is None:
+                self._stream.wait_stream(current_stream())
 
     def _run_in_aux_stream(
         self,
@@ -163,6 +168,11 @@ class SharedExperts(torch.nn.Module):
     ) -> torch.Tensor:
         # TODO: assert that maybe_sync_shared_experts_stream has been called.
 
+        # An eager break may have ended the earlier capture segment.
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        if BreakableCUDAGraphCapture.current() is not None:
+            self._stream.wait_stream(current_stream())
         # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
             output = self._layer(shared_experts_input)

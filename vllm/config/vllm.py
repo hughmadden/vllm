@@ -846,6 +846,30 @@ class VllmConfig:
             self.compilation_config.mode = CompilationMode.NONE
         return enabled
 
+    def _verify_breakable_cudagraph_compat(self) -> None:
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        if not is_breakable_cudagraph_enabled():
+            return
+        if self.parallel_config.enable_dbo:
+            raise ValueError(
+                "DBO (enable_dbo) is incompatible with breakable CUDA graphs: "
+                "capture state is thread-local. Disable DBO or breakable graphs."
+            )
+        mode = self.compilation_config.cudagraph_mode
+        if mode is not None and mode.has_full_cudagraphs() and (
+            self.kv_transfer_config is not None
+            or self.cache_config.kv_offloading_size is not None
+        ):
+            raise ValueError(
+                "FULL/FULL_AND_PIECEWISE breakable CUDA graphs are incompatible "
+                "with KV connectors (kv_transfer_config) and host-KV offloading "
+                "(kv_offloading_size): host KV hooks cannot be captured. "
+                "Use PIECEWISE graphs or disable breakable graphs."
+            )
+
     @property
     def needs_dp_coordinator(self) -> bool:
         """
@@ -1528,6 +1552,7 @@ class VllmConfig:
             self.compilation_config.mode = CompilationMode.NONE
 
         breakable_cudagraph_enabled = self._maybe_enable_breakable_cudagraph()
+        self._verify_breakable_cudagraph_compat()
 
         if not breakable_cudagraph_enabled and (
             self.compilation_config.backend == "eager"
@@ -1833,6 +1858,7 @@ class VllmConfig:
                     )
 
         # final check of cudagraph mode after all possible updates
+        self._verify_breakable_cudagraph_compat()
         if current_platform.is_cuda_alike():
             if (
                 self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -2009,6 +2035,8 @@ class VllmConfig:
         self._verify_kv_transfer_compat()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
+
+        _validate_afd_exchange_capacity(self)
 
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         # remove the sizes that not multiple of tp_size when
@@ -3023,3 +3051,62 @@ def get_layers_from_vllm_config(
         for layer_name in layer_names
         if isinstance(layer := forward_context.get(layer_name), layer_type)
     }
+
+
+# AFD P3 EXCHANGE CAPACITY GATE
+def _validate_afd_exchange_capacity(vllm_config):
+    """Check finalized scheduler/padded-graph budgets before any worker starts.
+
+    General plugins currently also accept VLLM_AFD_CONFIG before CLI config
+    parsing. Validate that source as well, so an additional_config block can
+    never conceal a smaller ring used by the environment-configured plugin.
+    """
+    import json
+    import os
+
+    blocks = []
+    additional = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional, dict) and additional.get("afd") is not None:
+        blocks.append(("additional_config.afd", additional["afd"]))
+    if os.environ.get("VLLM_AFD") == "1":
+        raw = json.loads(os.environ.get("VLLM_AFD_CONFIG", "{}"))
+        if isinstance(raw, dict) and list(raw) == ["afd"]:
+            raw = raw["afd"]
+        blocks.append(("VLLM_AFD_CONFIG", raw))
+    receipts = []
+    for source, afd in blocks:
+        if not isinstance(afd, dict):
+            raise ValueError(f"{source} must be a mapping for AFD ring validation")
+        if afd.get("role", "attention") != "attention":
+            continue
+        extra = afd.get("connector_extra_config", {})
+        if not isinstance(extra, dict):
+            raise ValueError(f"{source}.connector_extra_config must be a mapping")
+        capacity = extra.get("exchange_rows", 2048)
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("AFD exchange_rows must be a positive integer")
+        scheduler = vllm_config.scheduler_config
+        compilation = vllm_config.compilation_config
+        budgets = {"max_num_batched_tokens": scheduler.max_num_batched_tokens}
+        scheduled = getattr(scheduler, "max_num_scheduled_tokens", None)
+        if scheduled is not None:
+            budgets["max_num_scheduled_tokens"] = scheduled
+        for index, size in enumerate(compilation.cudagraph_capture_sizes or []):
+            budgets[f"cudagraph_capture_sizes[{index}]"] = size
+        graph_max = getattr(compilation, "max_cudagraph_capture_size", None)
+        if graph_max is not None:
+            budgets["max_cudagraph_capture_size"] = graph_max
+        for name, size in budgets.items():
+            if type(size) is not int or size < 0:
+                raise ValueError(f"AFD startup budget {name} must be a nonnegative integer")
+        required = max(budgets.values())
+        if required > capacity:
+            raise ValueError(
+                f"AFD exchange_rows={capacity} is smaller than startup row budget "
+                f"{required} ({budgets}); increase connector_extra_config.exchange_rows "
+                "or lower scheduler/graph limits before starting workers")
+        receipt = {"source": source, "exchange_rows": capacity,
+                   "required_rows": required, "budgets": budgets}
+        receipts.append(receipt)
+        logger.info("AFD_RING_GATE %s", json.dumps(receipt, sort_keys=True))
+    return receipts

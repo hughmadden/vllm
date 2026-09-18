@@ -13,6 +13,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
 )
@@ -308,7 +309,9 @@ class CudaGraphManager:
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
-        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[
+            BatchExecutionDescriptor, torch.cuda.CUDAGraph | BreakableCUDAGraphCapture
+        ] = {}
         self.graph_capture_resources: dict[BatchExecutionDescriptor, list[Any]] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
@@ -655,7 +658,14 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        # FULL local compute still permits explicit host/eager
+                        # seams (e.g. AFD). Keep the manager's static outputs.
+                        if self.use_breakable_cg:
+                            graph = BreakableCUDAGraphCapture(pool=self.pool)
+                            capture_context = graph
+                        else:
+                            graph = torch.cuda.CUDAGraph()
+                            capture_context = torch.cuda.graph(graph, self.pool)
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -666,11 +676,20 @@ class CudaGraphManager:
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
+                        if self.use_breakable_cg:
+                            # Match torch.cuda.graph after fresh metadata and
+                            # disk Engram preparation, once per descriptor.
+                            torch.accelerator.synchronize()
+                            gc.collect()
+                            torch.accelerator.empty_cache()
                         with (
                             collect_cuda_graph_capture_resources() as resources,
-                            torch.cuda.graph(graph, self.pool),
+                            capture_context,
                         ):
-                            forward_fn(CUDAGraphMode.NONE)
+                            forward_fn(
+                                CUDAGraphMode.FULL if self.use_breakable_cg
+                                else CUDAGraphMode.NONE
+                            )
                             # Join the offloader copy stream because the last layer
                             # can leave a prefetch pending at capture end.
                             get_offloader().join_after_forward()

@@ -615,6 +615,20 @@ class MoERunner(MoERunnerInterface):
                 workspace, shared_workspace = self._quant_method.prepare_workspace(
                     hidden_states, shared_size
                 )
+        # AFD P3: submit eager -> shared graph segment -> collect eager.
+        # The AFD method owns the join and invokes shared compute exactly once.
+        deferred = getattr(self._quant_method, "run_with_shared", None)
+        if deferred is not None:
+            topk_weights, topk_ids = self.router.select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                input_ids=input_ids,
+            )
+            return deferred(hidden_states, topk_weights, topk_ids,
+                            self._shared_experts, shared_experts_input,
+                            shared_workspace)
+
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
         )
