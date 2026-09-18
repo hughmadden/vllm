@@ -107,3 +107,53 @@ leases to the retained target executor and vLLM sampler. Confirm worker exit
 before incarnation replacement, and provide recompute or complete-checkpoint
 resume for preempted requests. This packet changes no model execution and makes
 no model-quality, throughput or GPU-memory qualification claim.
+
+## Cross-language CPU contract
+
+Rust example commit `b4125bd7b8a83482fa417d797fc5c1c31d0be450` adds
+`rust/crates/ds41rt-daemon/examples/native_cache_contract.rs`. It calls the
+actual `CacheCommands::execute` through real serde decoding/encoding and uses
+the canonical native `SourcePages` reservation/refcount code. It does not copy
+command handlers or page-allocation rules. Only device completion is faked;
+queued write destinations/tail-copy counts are inspected without GPU payloads.
+
+Build in the Rust repository with the retained lockfile/dependencies:
+
+```sh
+cd rust
+cargo build --offline --locked -p ds41rt-daemon --example native_cache_contract
+```
+
+Then, in this vLLM checkout:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 \
+AFD_NATIVE_CACHE_CONTRACT=/absolute/ds41rt/rust/target/debug/examples/native_cache_contract \
+uv run --offline --no-project --python .venv/bin/python .venv/bin/python \
+  -m pytest --noconftest tests/v1/core/test_native_cache_adapter.py \
+  tests/v1/core/test_native_cache_rust_contract.py -q
+```
+
+**Measured: 27 tests passed, including all seven real Rust/Python cases, with
+zero skips.** The Rust build completed offline with the existing native library
+warnings. Test binary SHA256 was
+`d87523803ea81b62aa1b1c93c2704d6c5021b1c669cc76369d7de34797e329b6`.
+The exercised CacheCommands implementation remains the schema-1 code at
+`aa12dda9`; the concurrent target-library extraction changes no command handler.
+No Python adapter correction was needed after crossing the actual boundary.
+
+The seven cases establish real serialized retry behavior, accepted/zero-count
+publication, out-of-order two-request completion, pending cancellation,
+four-pool reservation rollback, shared-tail copies with two prefix forks,
+reader-held release/reset, controlled start/poll failures and a new OS process
+with a different owner nonce. After drain/release, exact physical page credits
+return to native capacity. Source references still cannot satisfy a model hit.
+
+The example accepts genuine envelopes plus a separate, test-only `control` tag
+for snapshot, ready/failure injection and reader hold/drop. Controls are not
+production native executor commands. It bounds each input line to 128 KiB,
+commands to 10,000, held readers to 16, page capacities to 64 per pool, request
+slots to four and rows to 1,024. Python bounds response waits to five seconds
+and closes/reaps each local process. Without `AFD_NATIVE_CACHE_CONTRACT`, only
+this optional cross-repository suite skips; such a run is not cross-language
+qualification. No serving backend, GPU, weights or network endpoint is used.
