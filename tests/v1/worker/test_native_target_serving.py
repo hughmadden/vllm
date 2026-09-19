@@ -24,6 +24,8 @@ from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker.native_target import (
+    NativeBatchMember,
+    NativeBatchProposal,
     NativeCacheInfo,
     NativeGrant,
     NativeProposal,
@@ -465,10 +467,18 @@ class SamplerTests(unittest.TestCase):
     def test_stream_scheduler_runner_sampler_replay_publication_and_queue(self):
         self._native_flow("encoder_stream")
 
-    def _native_flow(self, mode, dspark=False):
+    def test_four_requests_sample_disjoint_rows_from_two_native_batch_leases(self):
+        self._native_flow("full_target", batching=True)
+
+    def _native_flow(self, mode, dspark=False, batching=False):
         streaming = mode == "encoder_stream"
-        cfg = config(batch=80 if streaming else 4, max_context=1024)
+        cfg = config(
+            slots=4 if batching else 2,
+            batch=80 if streaming or batching else 4,
+            max_context=1024,
+        )
         cfg.additional_config["afd_native_target"]["prefill_mode"] = mode
+        cfg.additional_config["afd_native_target"]["decode_batching"] = batching
         if dspark:
             cfg.additional_config["afd_native_target"]["dspark"] = {
                 "draft_limit": 3,
@@ -476,8 +486,11 @@ class SamplerTests(unittest.TestCase):
                 "confidence_cutoff": None,
             }
         sampler = NativeVllmSampler(cfg, torch.device("cpu"))
-        bank = Bank(capacity=2048, batch=80 if streaming else 4)
+        bank = Bank(capacity=2048, batch=80 if streaming or batching else 4)
         events, tickets = [], {}
+
+        def winner(grant):
+            return ord(grant.request_id) - ord("a") + 1 if batching else 2
 
         def submit(grant):
             if grant.phase == "encoder_stream":
@@ -488,13 +501,19 @@ class SamplerTests(unittest.TestCase):
             return grant.request_id
 
         def acquire(ticket):
-            rows = (
-                len(tickets[ticket].tokens) if tickets[ticket].phase == "dspark" else 1
+            members = (
+                tickets[ticket]
+                if isinstance(tickets[ticket], tuple)
+                else (tickets[ticket],)
             )
+            planes = []
+            for member in members:
+                rows = len(member.tokens) if member.phase == "dspark" else 1
+                logits = torch.zeros(rows, 8)
+                logits[:, winner(member)] = 4
+                planes.append(logits)
             return SimpleNamespace(
-                tensor=torch.tensor(
-                    [[0.0, 1.0, 3.0, 2.0, -2.0, -1.0, 0.5, 0.0]]
-                ).repeat(rows, 1),
+                tensor=torch.cat(planes),
                 drain_consumers=lambda: events.append(("drain", ticket)),
                 close=lambda: events.append(("close", ticket)),
             )
@@ -507,9 +526,43 @@ class SamplerTests(unittest.TestCase):
             return bank.ends[grant.request]
 
         def propose(grant):
-            tokens = (*grant.tokens, *((2,) * (grant.verification_rows - 1)))
+            tokens = (
+                *grant.tokens,
+                *((winner(grant),) * (grant.verification_rows - 1)),
+            )
             prepared = replace(grant, tokens=tokens, selected=tuple(range(len(tokens))))
             return NativeProposal(submit(prepared), tokens, 1)
+
+        def submit_batch(group):
+            ticket = f"batch{group.lane}"
+            tickets[ticket] = group.members
+            events.append(("submit_batch", group.lane, len(group.members)))
+            return ticket
+
+        def propose_batch(group):
+            members, prepared, offset = [], [], 0
+            for grant in group.members:
+                tokens = (
+                    *grant.tokens,
+                    *((winner(grant),) * (grant.verification_rows - 1)),
+                )
+                selected = tuple(range(len(tokens)))
+                members.append(
+                    NativeBatchMember(grant.request, tokens, selected, offset, offset)
+                )
+                prepared.append(replace(grant, tokens=tokens, selected=selected))
+                offset += len(tokens)
+            return NativeBatchProposal(
+                submit_batch(replace(group, members=tuple(prepared))), tuple(members), 1
+            )
+
+        def commit_batch(ticket, accepted):
+            self.assertIn(("close", ticket), events)
+            members = tickets.pop(ticket)
+            for grant, count in zip(members, accepted):
+                bank.ends[grant.request] += count
+            events.append(("commit_batch", ticket))
+            return tuple(bank.ends[g.request] for g in members)
 
         backend = SimpleNamespace(
             info=bank.info,
@@ -518,6 +571,9 @@ class SamplerTests(unittest.TestCase):
             committed_end=lambda req: bank.ends[req],
             submit=submit,
             propose=propose,
+            submit_batch=submit_batch,
+            propose_batch=propose_batch,
+            commit_batch=commit_batch,
             execute=lambda work: events.append(("execute", work)),
             acquire_logits=acquire,
             commit=commit,
@@ -551,7 +607,8 @@ class SamplerTests(unittest.TestCase):
         scheduler = NativeScheduler(
             cfg, SimpleNamespace(collective_rpc=rpc), bank.info(), None
         )
-        for name in "abc":
+        names = "abcd" if batching else "abc"
+        for name in names:
             prompt = tuple(i % 7 for i in range(370)) if streaming else (1, 2, 3)
             scheduler.add_request(
                 request(name, prompt, max_tokens=5 if dspark else 2, logprobs=3)
@@ -566,17 +623,27 @@ class SamplerTests(unittest.TestCase):
                 outputs.extend(output.outputs)
             if not scheduler.has_requests():
                 break
-        self.assertEqual(len(outputs), 6)
+        self.assertEqual(len(outputs), len(names) * 2)
         self.assertTrue(
-            all(item.new_token_ids == [2] * len(item.new_token_ids) for item in outputs)
+            all(
+                item.new_token_ids == [winner(item)] * len(item.new_token_ids)
+                for item in outputs
+            )
         )
         if dspark:
-            self.assertEqual(sum(len(item.new_token_ids) for item in outputs), 15)
+            self.assertEqual(
+                sum(len(item.new_token_ids) for item in outputs), len(names) * 5
+            )
             self.assertTrue(any(len(item.new_token_ids) == 4 for item in outputs))
-        self.assertEqual(sum(item.finished for item in outputs), 3)
+        self.assertEqual(sum(item.finished for item in outputs), len(names))
         self.assertFalse(bank.ends)
         self.assertFalse(tickets)
-        if streaming:
+        if batching:
+            self.assertEqual(
+                [e for e in events if e[0] == "submit_batch"],
+                [("submit_batch", 0, 2), ("submit_batch", 1, 2)],
+            )
+        elif streaming:
             self.assertEqual(events[:2], [("submit", "a"), ("execute", ("a",))])
             self.assertEqual([item.request_id for item in outputs], list("ababcc"))
         else:
@@ -586,6 +653,26 @@ class SamplerTests(unittest.TestCase):
 
 
 class ClientMappingTests(unittest.TestCase):
+    def test_batch_member_identity_and_offsets_survive_client_conversion(self):
+        remote = SimpleNamespace(owner=17, slot=2, generation=3)
+        member = SimpleNamespace(
+            request=remote,
+            tokens=(7, 8),
+            selected=(0, 1),
+            input_offset=3,
+            output_offset=3,
+        )
+        client = SimpleNamespace(
+            submit_speculative_batch=lambda group: SimpleNamespace(
+                ticket="group", members=(member,), draft_us=19
+            )
+        )
+        result = NativeClientBackend(client).propose_batch(object())
+        self.assertEqual(
+            result.members,
+            (NativeBatchMember(NativeRequest(17, 2, 3), (7, 8), (0, 1), 3, 3),),
+        )
+
     def test_proposal_preserves_native_ticket_and_owned_tokens(self):
         ticket = object()
         client = SimpleNamespace(
@@ -669,6 +756,21 @@ class BindingTests(unittest.TestCase):
         self.binding = RetainedNativeBinding()
 
     def test_supported_configuration_validates_without_creating_native_owner(self):
+        self.binding.validate_config(self.config)
+
+    def test_grouped_decode_requires_explicit_flag_and_complete_client_capability(self):
+        options = self.config.additional_config["afd_native_target"]
+        options["decode_batching"] = 1
+        with self.assertRaises(ValueError):
+            self.binding.validate_config(self.config)
+        options["decode_batching"] = True
+        with self.assertRaisesRegex(RuntimeError, "lacks grouped"):
+            self.binding.validate_config(self.config)
+        import sys
+
+        client = sys.modules["vllm_afd.native_target.client"].NativeTargetClient
+        for name in ("submit_batch", "submit_speculative_batch", "commit_batch"):
+            setattr(client, name, lambda *args: None)
         self.binding.validate_config(self.config)
 
     def test_speculative_configuration_requires_typed_limits_and_matching_client(self):
@@ -826,6 +928,78 @@ class SpeculativeSchedulerTests(unittest.TestCase):
         self.assertEqual(samples["vllm:spec_decode_num_accepted_tokens_total"], 1)
 
 
+class BatchSchedulerTests(unittest.TestCase):
+    """One pass per lane must advance C4 without a second physical allocator."""
+
+    finish_step = SchedulerTests.finish_step
+
+    def prepare(self, speculative=False):
+        cfg = config(slots=4, batch=80)
+        options = cfg.additional_config["afd_native_target"]
+        options["decode_batching"] = True
+        if speculative:
+            options["dspark"] = {
+                "draft_limit": 3,
+                "adaptive": False,
+                "confidence_cutoff": None,
+            }
+        self.bank = Bank(capacity=1024, batch=80)
+        self.scheduler = NativeScheduler(
+            cfg, SimpleNamespace(collective_rpc=self.bank.rpc), self.bank.info(), None
+        )
+        for name in "abcd":
+            self.scheduler.add_request(request(name, max_tokens=12))
+        self.finish_step(self.scheduler.schedule())
+        self.finish_step(self.scheduler.schedule())
+
+    def test_four_decodes_share_two_balanced_native_lane_batches(self):
+        self.prepare()
+        work = self.scheduler.schedule()
+        grants = work.native_target.grants
+        self.assertEqual([g.request_id for g in grants], list("abcd"))
+        self.assertEqual([g.lane for g in grants], [0, 1, 0, 1])
+        self.assertEqual(work.num_scheduled_tokens, dict.fromkeys("abcd", 1))
+        self.assertEqual(
+            self.bank.events[-1],
+            ("native_can_prepare", (tuple((g.request, 1) for g in grants),)),
+        )
+        self.finish_step(work)
+        self.assertEqual([r.num_output_tokens for r in self.scheduler.running], [2] * 4)
+
+    def test_draft_verification_envelopes_are_aggregated_per_lane_and_bank(self):
+        self.prepare(speculative=True)
+        work = self.scheduler.schedule()
+        self.assertEqual([g.phase for g in work.native_target.grants], ["dspark"] * 4)
+        self.assertEqual(work.num_scheduled_tokens, dict.fromkeys("abcd", 4))
+        self.assertEqual(work.total_num_scheduled_tokens, 16)
+        self.assertEqual([g.lane for g in work.native_target.grants], [0, 1, 0, 1])
+
+    def test_small_step_budget_rotates_unscheduled_requests_without_starvation(self):
+        self.prepare()
+        self.scheduler.token_budget = 2
+        first = self.scheduler.schedule()
+        self.assertEqual(list(first.num_scheduled_tokens), list("ab"))
+        self.finish_step(first)
+        second = self.scheduler.schedule()
+        self.assertEqual(list(second.num_scheduled_tokens), list("cd"))
+
+    def test_member_fallback_uses_anchor_only_within_homogeneous_speculative_batch(
+        self,
+    ):
+        self.prepare(speculative=True)
+        self.scheduler.requests["a"].sampling_params.logit_bias = {2: 4.0}
+        work = self.scheduler.schedule()
+        self.assertEqual([g.phase for g in work.native_target.grants], ["dspark"] * 4)
+        self.assertEqual(work.num_scheduled_tokens, {"a": 1, "b": 4, "c": 4, "d": 4})
+
+    def test_each_lane_respects_aggregate_native_capacity(self):
+        self.prepare(speculative=True)
+        self.scheduler.batch_tokens = 5
+        work = self.scheduler.schedule()
+        self.assertEqual(work.num_scheduled_tokens, {"a": 4, "b": 4, "c": 1, "d": 1})
+        self.assertEqual(work.total_num_scheduled_tokens, 10)
+
+
 class _CpuGreedyKernel:
     """CPU stub for the GPU primitive; real RejectionSampler orchestrates it."""
 
@@ -936,6 +1110,14 @@ class SpeculativeSamplerTests(unittest.TestCase):
 
     def test_stream_prefill_then_native_speculation_preserves_queue_progress(self):
         SamplerTests._native_flow(self, "encoder_stream", dspark=True)
+
+    def test_batched_drafts_slice_all_member_logits_and_publish_in_scheduler_order(
+        self,
+    ):
+        SamplerTests._native_flow(self, "full_target", dspark=True, batching=True)
+
+    def test_stream_prefill_seeds_four_request_batch_speculation(self):
+        SamplerTests._native_flow(self, "encoder_stream", dspark=True, batching=True)
 
     def verify(self, drafts=(2, 3), winners=(2, 3, 4), **params):
         req = request(max_tokens=params.pop("max_tokens", 8), logprobs=3, **params)

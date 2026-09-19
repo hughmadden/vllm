@@ -89,10 +89,34 @@ class NativeProposal:
 
 
 @dataclass(frozen=True)
+class NativeBatchGrant:
+    lane: int
+    placement: int
+    members: tuple[NativeGrant, ...]
+
+
+@dataclass(frozen=True)
+class NativeBatchMember:
+    request: NativeRequest
+    tokens: tuple[int, ...]
+    selected: tuple[int, ...]
+    input_offset: int
+    output_offset: int
+
+
+@dataclass(frozen=True)
+class NativeBatchProposal:
+    ticket: Any
+    members: tuple[NativeBatchMember, ...]
+    draft_us: int
+
+
+@dataclass(frozen=True)
 class NativeSchedule:
     owner: int
     step_id: int
     grants: tuple[NativeGrant, ...]
+    batching: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,6 +162,12 @@ class NativeTargetBackend(Protocol):
     def propose(self, grant: NativeGrant) -> NativeProposal:
         """Return the native-owned anchor/drafts within the reserved envelope."""
         ...
+
+    def submit_batch(self, grant: NativeBatchGrant) -> Any: ...
+    def propose_batch(self, grant: NativeBatchGrant) -> NativeBatchProposal: ...
+    def commit_batch(
+        self, ticket: Any, accepted: tuple[int, ...]
+    ) -> tuple[int, ...]: ...
 
     def execute(self, tickets: tuple[Any, ...]) -> None:
         """Drive the submitted native futures together to bounded completion."""
@@ -276,6 +306,26 @@ class _Active:
     grant: NativeGrant
     ticket: Any
     logits: NativeLogitsLease | None = None
+    members: tuple[NativeGrant, ...] | None = None
+
+    @property
+    def grants(self):
+        return self.members if self.members is not None else (self.grant,)
+
+
+@dataclass(frozen=True)
+class _LogitsSlice:
+    parent: NativeLogitsLease
+    start: int
+    end: int
+    total: int
+
+    @property
+    def tensor(self):
+        tensor = self.parent.tensor
+        if tensor.ndim != 2 or tensor.shape[0] != self.total:
+            raise RuntimeError("native batch logits extent differs")
+        return tensor[self.start : self.end]
 
 
 class NativeTargetRunner:
@@ -294,6 +344,7 @@ class NativeTargetRunner:
         self._backend: NativeTargetBackend | None = None
         self._sampler: NativeSampler | None = None
         self._active: list[_Active] = []
+        self._request_order: tuple[str, ...] = ()
         self._revoked: dict[int, NativeRequest] = {}
         self._last_step = 0
         self._loaded = self._failed = self._closed = False
@@ -348,7 +399,9 @@ class NativeTargetRunner:
     def release(self, request: NativeRequest) -> None:
         with self._lock:
             backend = self._ready()
-            if any(entry.grant.request == request for entry in self._active):
+            if any(
+                g.request == request for entry in self._active for g in entry.grants
+            ):
                 raise RuntimeError(
                     "native request still active; cancel or sample first"
                 )
@@ -372,7 +425,8 @@ class NativeTargetRunner:
             or work.owner != self.owner
             or work.step_id != self._last_step + 1
             or not isinstance(work.grants, tuple)
-            or not 0 <= len(work.grants) <= 2
+            or type(work.batching) is not bool
+            or not 0 <= len(work.grants) <= (16 if work.batching else 2)
         ):
             raise ValueError("invalid native owner, sequence or grants")
         if output.scheduled_spec_decode_tokens or output.scheduled_encoder_inputs:
@@ -381,6 +435,8 @@ class NativeTargetRunner:
             )
         info = self.cache_info()
         options = self.config.additional_config["afd_native_target"]
+        if work.batching and options.get("decode_batching") is not True:
+            raise ValueError("native decode batching is not enabled")
         lanes, requests, names = set(), set(), set()
         for grant in work.grants:
             streaming = (
@@ -396,7 +452,7 @@ class NativeTargetRunner:
                 or not isinstance(grant.request, NativeRequest)
                 or grant.request.owner != self.owner
                 or grant.lane not in (0, 1)
-                or grant.lane in lanes
+                or (not work.batching and grant.lane in lanes)
                 or grant.request in requests
                 or grant.request_id in names
                 or not isinstance(grant.tokens, tuple)
@@ -456,16 +512,88 @@ class NativeTargetRunner:
                 or grant.selected != tuple(range(grant.verification_rows))
             ):
                 raise ValueError("invalid native speculative verification envelope")
+            if work.batching and (
+                grant.kind != "decode"
+                or streaming
+                or grant.committed_end <= 0
+                or (
+                    not speculative
+                    and (len(grant.tokens) != 1 or grant.selected != (0,))
+                )
+            ):
+                raise ValueError("native batches require one decode anchor per request")
             lanes.add(grant.lane)
             requests.add(grant.request)
             names.add(grant.request_id)
         counts = {g.request_id: g.scheduled_rows for g in work.grants}
+        if work.batching:
+            for lane in lanes:
+                members = [g for g in work.grants if g.lane == lane]
+                if (
+                    len(members) > 8
+                    or len({g.phase for g in members}) != 1
+                    or len({g.placement for g in members}) != 1
+                    or sum(g.scheduled_rows for g in members)
+                    > min(info.capacity_rows, options["batch_tokens"])
+                    or sum(len(g.selected) for g in members) > 48
+                ):
+                    raise ValueError(
+                        "native batch exceeds lane capacity or mixes phases"
+                    )
+            if (
+                sum(counts.values())
+                > self.config.scheduler_config.max_num_batched_tokens
+            ):
+                raise ValueError("native batch exceeds scheduler token budget")
         if (
             output.num_scheduled_tokens != counts
             or output.total_num_scheduled_tokens != sum(counts.values())
         ):
             raise ValueError("native tokens exceed or differ from scheduler grant")
         return work
+
+    def _submit_batch(self, members):
+        assert self._backend is not None
+        first = members[0]
+        group = NativeBatchGrant(first.lane, first.placement, members)
+        if first.phase != "dspark":
+            ticket = self._backend.submit_batch(group)
+            self._active.append(_Active(first, ticket, members=members))
+            return
+        proposal = self._backend.propose_batch(group)
+        if not isinstance(proposal, NativeBatchProposal):
+            raise RuntimeError("invalid native batch proposal receipt")
+        entry = _Active(first, proposal.ticket, members=members)
+        self._active.append(entry)
+        if (
+            not isinstance(proposal.members, tuple)
+            or len(proposal.members) != len(members)
+            or type(proposal.draft_us) is not int
+            or not 0 <= proposal.draft_us < 2**64
+        ):
+            raise RuntimeError("invalid native batch proposal manifest")
+        resolved, input_offset, output_offset = [], 0, 0
+        for grant, member in zip(members, proposal.members):
+            if (
+                not isinstance(member, NativeBatchMember)
+                or member.request != grant.request
+                or not isinstance(member.tokens, tuple)
+                or not 1 <= len(member.tokens) <= grant.verification_rows
+                or member.tokens[0] != grant.tokens[0]
+                or any(type(t) is not int or not 0 <= t < 2**32 for t in member.tokens)
+                or member.selected != tuple(range(len(member.tokens)))
+                or type(member.input_offset) is not int
+                or member.input_offset != input_offset
+                or type(member.output_offset) is not int
+                or member.output_offset != output_offset
+            ):
+                raise RuntimeError("invalid native batch proposal member or offsets")
+            resolved.append(
+                replace(grant, tokens=member.tokens, selected=member.selected)
+            )
+            input_offset += len(member.tokens)
+            output_offset += len(member.selected)
+        entry.members = tuple(resolved)
 
     def execute_model(self, scheduler_output: SchedulerOutput):
         with self._lock:
@@ -474,6 +602,7 @@ class NativeTargetRunner:
             work = self._validate_schedule(scheduler_output)
             backend = self._ready()
             self._last_step = work.step_id
+            self._request_order = tuple(g.request_id for g in work.grants)
             try:
                 assert self._sampler is not None
                 self._sampler.update_requests(scheduler_output)
@@ -488,6 +617,15 @@ class NativeTargetRunner:
                         ),
                     )
                 for grant in work.grants:
+                    if work.batching:
+                        if any(
+                            entry.grant.lane == grant.lane for entry in self._active
+                        ):
+                            continue
+                        self._submit_batch(
+                            tuple(g for g in work.grants if g.lane == grant.lane)
+                        )
+                        continue
                     if grant.phase == "dspark":
                         proposal = backend.propose(grant)
                         if not isinstance(proposal, NativeProposal):
@@ -538,8 +676,24 @@ class NativeTargetRunner:
                 raise RuntimeError("no native result to sample")
             assert self._sampler is not None
             try:
-                grants = tuple(entry.grant for entry in self._active)
-                leases = tuple(entry.logits for entry in self._active)
+                rows = {}
+                for entry in self._active:
+                    total, offset = sum(len(g.selected) for g in entry.grants), 0
+                    for grant in entry.grants:
+                        lease = (
+                            entry.logits
+                            if entry.members is None
+                            else _LogitsSlice(
+                                entry.logits,
+                                offset,
+                                offset + len(grant.selected),
+                                total,
+                            )
+                        )
+                        rows[grant.request_id] = (grant, lease)
+                        offset += len(grant.selected)
+                grants = tuple(rows[name][0] for name in self._request_order)
+                leases = tuple(rows[name][1] for name in self._request_order)
                 assert all(lease is not None for lease in leases)
                 sample = self._sampler.sample(grants, leases, grammar_output)
                 if (
@@ -562,18 +716,35 @@ class NativeTargetRunner:
                 ):
                     raise RuntimeError("invalid native sampler result")
                 self._drain_logits()
-                committed = []
-                for accepted in sample.accepted:
+                committed = {}
+                accepted_by_request = dict(zip(self._request_order, sample.accepted))
+                while self._active:
                     entry = self._active[0]
-                    end = backend.commit(entry.ticket, accepted)
+                    accepted = tuple(
+                        accepted_by_request[g.request_id] for g in entry.grants
+                    )
+                    ends = (
+                        backend.commit_batch(entry.ticket, accepted)
+                        if entry.members is not None
+                        else (backend.commit(entry.ticket, accepted[0]),)
+                    )
                     self._active.pop(0)
-                    if end != entry.grant.committed_end + accepted:
+                    if (
+                        not isinstance(ends, tuple)
+                        or len(ends) != len(entry.grants)
+                        or any(
+                            type(end) is not int or end != grant.committed_end + count
+                            for end, grant, count in zip(ends, entry.grants, accepted)
+                        )
+                    ):
                         raise RuntimeError("native committed extent mismatch")
-                    committed.append((entry.grant.request_id, end))
+                    committed.update(
+                        (g.request_id, end) for g, end in zip(entry.grants, ends)
+                    )
                 sample.output.native_target = NativeStepResult(
                     self.owner,
                     self._last_step,
-                    tuple(committed),
+                    tuple((name, committed[name]) for name in self._request_order),
                     self.cache_info(),
                     tuple(
                         (g.request_id, len(g.tokens) - 1, n - 1)
@@ -595,7 +766,8 @@ class NativeTargetRunner:
                 assert self._backend is not None
                 entry = self._active[0]
                 if self._backend.cancel(entry.ticket):
-                    self._revoked[entry.grant.request.slot] = entry.grant.request
+                    for grant in entry.grants:
+                        self._revoked[grant.request.slot] = grant.request
                 self._active.pop(0)
 
     def shutdown(self):

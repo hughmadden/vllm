@@ -67,6 +67,7 @@ class NativeScheduler(SchedulerInterface):
         self.token_budget = vllm_config.scheduler_config.max_num_batched_tokens
         self.prefill_mode = options.get("prefill_mode", "full_target")
         self.draft_limit = (options.get("dspark") or {}).get("draft_limit", 0)
+        self.decode_batching = options.get("decode_batching", False)
         self._speculative_stats = None
         self.stream_chunk_rows = min(self.batch_tokens, self.token_budget)
         if self.prefill_mode == "encoder_stream" and self.stream_chunk_rows < 80:
@@ -177,6 +178,8 @@ class NativeScheduler(SchedulerInterface):
         if not reusing_name:
             self._admit_waiting()
         grants = []
+        grouping = False
+        lane_rows, lane_members = [0, 0], [0, 0]
         remaining = self.token_budget
         if self._pause_state != PauseState.PAUSED_ALL and not reusing_name:
             decodes = [
@@ -185,9 +188,33 @@ class NativeScheduler(SchedulerInterface):
             candidates = self.running
             if throttle_prefills and decodes:
                 candidates = decodes
+            grouping = (
+                self.decode_batching
+                and bool(candidates)
+                and all(
+                    r.num_computed_tokens >= r.num_prompt_tokens
+                    and r.num_tokens - r.num_computed_tokens == 1
+                    for r in candidates
+                )
+            )
             for request in candidates:
-                if len(grants) == 2 or remaining == 0:
+                if len(grants) == (16 if grouping else 2) or remaining == 0:
                     break
+                lane = len(grants)
+                lane_available = self.batch_tokens
+                if grouping:
+                    available = [
+                        i
+                        for i in (0, 1)
+                        if lane_members[i] < 8
+                        and lane_rows[i] < min(self.batch_tokens, 48)
+                    ]
+                    if not available:
+                        break
+                    lane = min(
+                        available, key=lambda i: (lane_members[i], lane_rows[i], i)
+                    )
+                    lane_available = min(self.batch_tokens, 48) - lane_rows[lane]
                 start = request.num_computed_tokens
                 streaming = (
                     self.prefill_mode == "encoder_stream"
@@ -201,8 +228,7 @@ class NativeScheduler(SchedulerInterface):
                     self.draft_limit > 0
                     and start >= request.num_prompt_tokens
                     and request.num_tokens - start == 1
-                    and not params.logit_bias
-                    and not params.min_p
+                    and (grouping or (not params.logit_bias and not params.min_p))
                 )
                 count = (
                     request.num_prompt_tokens
@@ -216,7 +242,10 @@ class NativeScheduler(SchedulerInterface):
                         remaining,
                         request.max_tokens - request.num_output_tokens,
                         self.max_model_len - request.num_tokens,
+                        lane_available,
                     )
+                    if params.logit_bias or params.min_p:
+                        count = min(count, 1)
                 if count <= 0:
                     raise RuntimeError("native request has no granted input token")
                 tokens = tuple(
@@ -225,7 +254,7 @@ class NativeScheduler(SchedulerInterface):
                 grant = NativeGrant(
                     request.request_id,
                     self.leases[request.request_id],
-                    len(grants),
+                    lane,
                     start,
                     tokens,
                     tuple(range(count)) if speculative else (count - 1,),
@@ -238,6 +267,9 @@ class NativeScheduler(SchedulerInterface):
                     verification_rows=count if speculative else 0,
                 )
                 grants.append(grant)
+                if grouping:
+                    lane_members[lane] += 1
+                    lane_rows[lane] += count
                 output.num_scheduled_tokens[request.request_id] = count
                 remaining = 0 if streaming else remaining - count
                 request.is_prefill_chunk = (
@@ -260,7 +292,7 @@ class NativeScheduler(SchedulerInterface):
             ]
         output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
         output.native_target = NativeSchedule(
-            self.owner, self.current_step, tuple(grants)
+            self.owner, self.current_step, tuple(grants), batching=grouping
         )
         self._inflight = output.native_target
         return output

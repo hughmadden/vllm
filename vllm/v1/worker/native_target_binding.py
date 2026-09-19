@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 
 from vllm.v1.worker.native_target import (
+    NativeBatchMember,
+    NativeBatchProposal,
     NativeCacheInfo,
     NativeProposal,
     NativeRequest,
@@ -50,6 +52,26 @@ class NativeClientBackend:
         return NativeProposal(
             proposal.ticket, tuple(proposal.tokens), proposal.draft_us
         )
+
+    def submit_batch(self, grant):
+        return self.client.submit_batch(grant)
+
+    def propose_batch(self, grant):
+        proposal = self.client.submit_speculative_batch(grant)
+        members = tuple(
+            NativeBatchMember(
+                NativeRequest(m.request.owner, m.request.slot, m.request.generation),
+                tuple(m.tokens),
+                tuple(m.selected),
+                m.input_offset,
+                m.output_offset,
+            )
+            for m in proposal.members
+        )
+        return NativeBatchProposal(proposal.ticket, members, proposal.draft_us)
+
+    def commit_batch(self, ticket, accepted):
+        return self.client.commit_batch(ticket, accepted)
 
     def execute(self, tickets):
         self.client.execute(tickets)
@@ -97,6 +119,7 @@ class RetainedNativeBinding:
             "poll_interval_s",
             "prefill_mode",
             "dspark",
+            "decode_batching",
         }:
             raise ValueError(
                 "native retained binding needs explicit artifacts, peers "
@@ -104,6 +127,9 @@ class RetainedNativeBinding:
             )
         if options["implementation"] != "retained":
             raise ValueError("unknown native target implementation")
+        batching = options.get("decode_batching", False)
+        if type(batching) is not bool:
+            raise ValueError("native decode_batching must be boolean")
         mode = options.get("prefill_mode", "full_target")
         if mode not in ("full_target", "encoder_stream"):
             raise ValueError("unknown native prefill mode")
@@ -185,6 +211,11 @@ class RetainedNativeBinding:
             )
         if dspark is not None and not hasattr(NativeTargetClient, "submit_speculative"):
             raise NativeTargetUnavailable("native target client lacks dSpark proposals")
+        if batching and not all(
+            hasattr(NativeTargetClient, name)
+            for name in ("submit_batch", "submit_speculative_batch", "commit_batch")
+        ):
+            raise NativeTargetUnavailable("native target client lacks grouped decode")
 
     def create_sampler(self, config, device):
         from vllm.v1.worker.native_target_sampler import NativeVllmSampler

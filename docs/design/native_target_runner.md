@@ -208,6 +208,46 @@ replay seeds them, allowing either prefill mode and the target-only fallback.
 Native joint commit currently synchronizes its publication work; overlap and
 net speedup require measurement, not inference from accepted counts.
 
+## Grouped native decode opt-in
+
+`decode_batching=true` within `afd_native_target` groups ready decodes into one
+actual native `RequestBatch` / `TargetPass` per lane. It defaults to false to retain
+the singleton comparison. It requires the additive client methods `submit_batch`,
+`submit_speculative_batch` and `commit_batch`, with matching native C ABI support;
+older clients fail during configuration rather than silently executing singletons.
+
+This addresses a measured structural difference: the singleton adapter needs two
+complete paired layer-stack waves to advance four requests, while retained Rust
+prepares two request members together on each of its two lanes. Round-robin
+selection already prevents starvation; merely changing request order cannot
+remove the extra wave. Performance still depends on live numerical qualification
+and measurement of the complete grouped path.
+
+Steady decode grants retain their original request order and are balanced across
+the two lanes. Each lane accepts at most eight distinct requests, at most its
+configured native row capacity, and at most 48 selected rows. The step token
+budget bounds the total. The aggregate native credit query covers all selected
+members before either lane starts. When budget or capacity excludes a request,
+rotation advances it next round. Fresh or recomputed prefills retain the existing
+singleton behavior; encoder streaming remains exclusive across both contexts.
+
+Grouped dSpark uses one owned proposal manifest per lane with per-member token
+lists, local selected rows and compact input/output offsets. Adaptive lengths may
+differ. Logit-bias/min-p requests reserve E=1 within the same homogeneous proposal
+batch, preserving their ordinary vLLM sampling semantics. Each immutable native
+result lease covers the concatenated selected rows. The worker supplies validated
+per-request slices on the same consumer stream, samples each request independently,
+and restores scheduler order. It drains the one shared native fence before sending
+the accepted-count vector in native member order. Only acknowledged per-member
+frontiers advance scheduler state. A stop may retire one member while others
+continue; no second KV allocator or physical credit cache is introduced.
+
+Cancel affects the whole group's private work. All members stay owned until the
+shared result fence drains; release of any member is blocked while active. If the
+native cancellation receipt revokes every admission, the runner retains a receipt
+for each member so later scheduler retirement cannot release stale handles twice.
+Mixed revocation receipts are rejected by the client.
+
 ## Remaining qualification
 
 - Run GPU startup and strict C1/C2 numerical gates, including mixed request
@@ -219,6 +259,9 @@ net speedup require measurement, not inference from accepted counts.
   quality, C1/C2 invariance, stop/accounting and matched decode throughput against
   target-only and retained Rust. CPU fake-kernel tests do not qualify CUDA
   rejection kernels, the draft checkpoint or target/draft numerical agreement.
+- Compare grouped C1/C2/C4 target and dSpark logits, token/logprob quality and
+  throughput with singleton and retained Rust. Cross-row native numerical gates
+  remain mandatory before this flag is used in a measured candidate.
 - Complete model checkpoint lifecycle before enabling prefix hits. Source pages
   alone omit windows, compressor/Engram history and replay state.
 - Measure native memory, throughput and conservative admission's concurrency cost.
@@ -243,7 +286,11 @@ PYTHONDONTWRITEBYTECODE=1 uv run --offline --no-project \
 owned proposal bounds, adaptive shortening, cancellation, context/output limits
 and accepted-only publication. It uses the same fake-backend fixtures.
 
-`tests/v1/worker/test_native_target_serving.py` passes 46 cases using stdlib
+`tests/v1/worker/test_native_target_batch.py` adds nine CPU ownership cases for
+grouped tickets, per-member accepted vectors, malformed manifests, shared fence
+timeouts, aggregate bounds and all-member cancellation receipts.
+
+`tests/v1/worker/test_native_target_serving.py` passes 56 cases using stdlib
 `unittest` with real
 Torch and vLLM request/output/sampling modules in retained image
 `sha256:8041c897278b8372c15784d3a651c1cba689c24ccf6c12842ad3a7bf5b85abbe`.
@@ -261,7 +308,10 @@ unit-probability drafts, rejection/recovery/bonus, positional logprobs, stop
 trimming, actual proposal counts, native credits and full/stream prefill followed
 by two-context speculation with a third request queued. GPU performance is not
 represented by these stubs. Final retained CPU container:
-`afd-native-dspark-serving-cpu-v3`.
+`afd-native-batch-serving-cpu-v2`. Grouped tests use different logits for each
+request, so swapping compact row slices or publishing in native-group order
+instead of scheduler order fails the test. They also exercise native per-lane
+capacity, budget rotation and anchor-only sampling fallbacks.
 
 No dependencies were installed. Retained Ruff supplies scoped lint/format checks;
 full pre-commit is unavailable offline. The local environment lacks Torch/msgspec,
