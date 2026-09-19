@@ -7,11 +7,15 @@ from types import SimpleNamespace
 import pytest
 
 from .test_native_target import (
-    binding,  # noqa: F401 -- shared CPU fixture
+    binding as native_binding_fixture,
+)
+from .test_native_target import (
     method,
     output_type,  # noqa: F401 -- shared CPU fixture dependency
     ready,
 )
+
+binding = native_binding_fixture
 
 
 @pytest.mark.parametrize("utility", ["reset_mm_cache", "reset_encoder_cache"])

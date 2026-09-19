@@ -64,6 +64,10 @@ class NativeScheduler(SchedulerInterface):
         )
         self.batch_tokens = min(options["batch_tokens"], cache_info.capacity_rows)
         self.token_budget = vllm_config.scheduler_config.max_num_batched_tokens
+        self.prefill_mode = options.get("prefill_mode", "full_target")
+        self.stream_chunk_rows = min(self.batch_tokens, self.token_budget)
+        if self.prefill_mode == "encoder_stream" and self.stream_chunk_rows < 80:
+            raise ValueError("native encoder stream needs at least 80 rows per chunk")
         self.cache_info = cache_info
         self.owner = cache_info.owner
         self.log_stats, self.include_finished_set = log_stats, include_finished_set
@@ -182,7 +186,18 @@ class NativeScheduler(SchedulerInterface):
                 if len(grants) == 2 or remaining == 0:
                     break
                 start = request.num_computed_tokens
-                count = min(request.num_tokens - start, self.batch_tokens, remaining)
+                streaming = (
+                    self.prefill_mode == "encoder_stream"
+                    and start == 0
+                    and request.num_output_tokens == 0
+                )
+                if streaming and grants:
+                    break  # The next round starts with this exclusive prefill.
+                count = (
+                    request.num_prompt_tokens
+                    if streaming
+                    else min(request.num_tokens - start, self.batch_tokens, remaining)
+                )
                 if count <= 0:
                     raise RuntimeError("native request has no granted input token")
                 tokens = tuple(request.all_token_ids[start : start + count])
@@ -195,10 +210,12 @@ class NativeScheduler(SchedulerInterface):
                     (count - 1,),
                     "prefill" if start < request.num_prompt_tokens else "decode",
                     0,
+                    phase="encoder_stream" if streaming else "full_target",
+                    chunk_rows=self.stream_chunk_rows if streaming else None,
                 )
                 grants.append(grant)
                 output.num_scheduled_tokens[request.request_id] = count
-                remaining -= count
+                remaining = 0 if streaming else remaining - count
                 request.is_prefill_chunk = start + count < request.num_tokens
                 if request.request_id in self._new:
                     output.scheduled_new_reqs.append(

@@ -73,6 +73,7 @@ class NativeGrant:
     kind: str
     placement: int
     phase: str = "full_target"
+    chunk_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,8 +128,8 @@ class NativeTargetBackend(Protocol):
 
     def acquire_logits(self, ticket: Any) -> NativeLogitsLease: ...
     def commit(self, ticket: Any, accepted: int) -> int: ...
-    def cancel(self, ticket: Any) -> None:
-        """Drain native work before discarding this ticket's private state."""
+    def cancel(self, ticket: Any) -> bool:
+        """Drain work; return whether native revoked the entire admission."""
         ...
 
     def close(self) -> None: ...
@@ -276,6 +277,7 @@ class NativeTargetRunner:
         self._backend: NativeTargetBackend | None = None
         self._sampler: NativeSampler | None = None
         self._active: list[_Active] = []
+        self._revoked: dict[int, NativeRequest] = {}
         self._last_step = 0
         self._loaded = self._failed = self._closed = False
         self._lock = RLock()
@@ -323,6 +325,7 @@ class NativeTargetRunner:
             ):
                 self._failed = True
                 raise RuntimeError("invalid native admission handle")
+            self._revoked.pop(slot, None)
             return request
 
     def release(self, request: NativeRequest) -> None:
@@ -332,6 +335,10 @@ class NativeTargetRunner:
                 raise RuntimeError(
                     "native request still active; cancel or sample first"
                 )
+            if self._revoked.get(request.slot) == request:
+                # Streaming cancellation already released the actual bank.
+                self._revoked.pop(request.slot)
+                return
             backend.release(request)
 
     def can_prepare(self, work):
@@ -356,11 +363,15 @@ class NativeTargetRunner:
                 "native speculation and image work are unbound"
             )
         info = self.cache_info()
+        options = self.config.additional_config["afd_native_target"]
         lanes, requests, names = set(), set(), set()
         for grant in work.grants:
+            streaming = (
+                isinstance(grant, NativeGrant) and grant.phase == "encoder_stream"
+            )
             if (
                 not isinstance(grant, NativeGrant)
-                or grant.phase != "full_target"
+                or grant.phase not in ("full_target", "encoder_stream")
                 or grant.kind not in ("prefill", "decode")
                 or not isinstance(grant.request, NativeRequest)
                 or grant.request.owner != self.owner
@@ -369,7 +380,14 @@ class NativeTargetRunner:
                 or grant.request in requests
                 or grant.request_id in names
                 or not isinstance(grant.tokens, tuple)
-                or not 1 <= len(grant.tokens) <= info.capacity_rows
+                or not grant.tokens
+                or (
+                    not streaming
+                    and (
+                        len(grant.tokens) > info.capacity_rows
+                        or grant.chunk_rows is not None
+                    )
+                )
                 or any(type(t) is not int or not 0 <= t < 2**32 for t in grant.tokens)
                 or not isinstance(grant.selected, tuple)
                 or not 1 <= len(grant.selected) <= 48
@@ -384,6 +402,24 @@ class NativeTargetRunner:
                 or grant.committed_end != backend.committed_end(grant.request)
             ):
                 raise ValueError("invalid or unsupported native target grant")
+            if streaming and (
+                options.get("prefill_mode", "full_target") != "encoder_stream"
+                or len(work.grants) != 1
+                or grant.lane != 0
+                or grant.committed_end != 0
+                or grant.kind != "prefill"
+                or len(grant.tokens) > self.config.model_config.max_model_len
+                or type(grant.chunk_rows) is not int
+                or not 80
+                <= grant.chunk_rows
+                <= min(
+                    info.capacity_rows,
+                    options["batch_tokens"],
+                    self.config.scheduler_config.max_num_batched_tokens,
+                )
+                or grant.selected[0] < max(0, len(grant.tokens) - 128)
+            ):
+                raise ValueError("invalid or nonexclusive native encoder stream")
             lanes.add(grant.lane)
             requests.add(grant.request)
             names.add(grant.request_id)
@@ -453,7 +489,9 @@ class NativeTargetRunner:
                     != {g.request_id: i for i, g in enumerate(grants)}
                     or len(sample.accepted) != len(grants)
                     or any(
-                        type(n) is not int or not 0 <= n <= len(g.tokens)
+                        type(n) is not int
+                        or not 0 <= n <= len(g.tokens)
+                        or (g.phase == "encoder_stream" and n != len(g.tokens))
                         for n, g in zip(sample.accepted, grants)
                     )
                 ):
@@ -482,7 +520,9 @@ class NativeTargetRunner:
             self._drain_logits()
             while self._active:
                 assert self._backend is not None
-                self._backend.cancel(self._active[0].ticket)
+                entry = self._active[0]
+                if self._backend.cancel(entry.ticket):
+                    self._revoked[entry.grant.request.slot] = entry.grant.request
                 self._active.pop(0)
 
     def shutdown(self):
@@ -497,6 +537,7 @@ class NativeTargetRunner:
                 self._sampler.close()
                 self._sampler = None
             self._closed = True
+            self._revoked.clear()
 
     def get_supported_tasks(self):
         return ("generate",)

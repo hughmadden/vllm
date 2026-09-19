@@ -98,13 +98,15 @@ class Backend:
     def __init__(self, owner, events):
         self.owner, self.events = owner, events
         self.ends, self.active, self.leases = {}, {}, set()
+        self.generations = {}
         self.fail_execute = self.fail_drain = self.fail_commit = False
 
     def info(self):
         return native.NativeCacheInfo(self.owner, 256, (4,) * 4, (4,) * 4, 4096)
 
     def admit(self, slot, request_id):
-        handle = native.NativeRequest(self.owner, slot, 1)
+        self.generations[slot] = self.generations.get(slot, 0) + 1
+        handle = native.NativeRequest(self.owner, slot, self.generations[slot])
         self.ends[handle] = 0
         self.events.append(("admit", slot, request_id))
         return handle
@@ -139,7 +141,11 @@ class Backend:
     def cancel(self, ticket):
         assert ticket not in self.leases
         self.events.append(("cancel", ticket))
-        self.active.pop(ticket, None)
+        grant = self.active.pop(ticket, None)
+        if grant is not None and grant.phase == "encoder_stream":
+            del self.ends[grant.request]
+            return True
+        return False
 
     def release(self, request):
         assert not any(g.request == request for g in self.active.values())
@@ -642,3 +648,134 @@ def test_native_admission_validation_uses_request_error_boundary():
     )
     with pytest.raises(ValueError, match="unsupported"):
         preprocess(engine, SimpleNamespace(mm_features=None, current_wave=0))
+
+
+def stream_ready(binding):
+    cfg = config()
+    cfg.additional_config["afd_native_target"].update(
+        prefill_mode="encoder_stream", batch_tokens=256
+    )
+    cfg.model_config.max_model_len = 1024
+    cfg.scheduler_config.max_num_batched_tokens = 256
+    runner = native.NativeTargetRunner(cfg, "cuda:0", binding, owner=17)
+    runner.load_model()
+    return runner
+
+
+def stream_work(runner, rows=370):
+    work = schedule(runner, rows=rows)
+    grant = replace(work.native_target.grants[0], phase="encoder_stream", chunk_rows=80)
+    work.native_target = replace(work.native_target, grants=(grant,))
+    return work
+
+
+def test_stream_whole_prompt_grant_exceeds_chunk_capacity_and_commits_once(binding):
+    runner = stream_ready(binding)
+    work = stream_work(runner)
+    runner.execute_model(work)
+    assert binding.backend.ends[work.native_target.grants[0].request] == 0
+    output = runner.sample_tokens(None)
+    assert output.native_target.committed_ends == (("0", 370),)
+    assert binding.events.count(("commit", 0, 370)) == 1
+    runner.shutdown()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"chunk_rows": 79},
+        {"chunk_rows": 257},
+        {"committed_end": 1},
+        {"selected": (0,)},
+        {"lane": 1},
+        {"kind": "decode"},
+    ],
+)
+def test_stream_invalid_geometry_rejects_before_native_mutation(binding, change):
+    runner = stream_ready(binding)
+    work = stream_work(runner)
+    work.native_target = replace(
+        work.native_target, grants=(replace(work.native_target.grants[0], **change),)
+    )
+    with pytest.raises(ValueError):
+        runner.execute_model(work)
+    assert not binding.backend.active
+    runner.shutdown()
+
+
+def test_stream_cancel_revokes_admission_then_reentry_uses_new_generation(binding):
+    runner = stream_ready(binding)
+    work = stream_work(runner)
+    old = work.native_target.grants[0].request
+    runner.execute_model(work)
+    runner.cancel_step()
+    assert old not in binding.backend.ends
+    runner.release(old)  # consumes revocation receipt; no second native release
+    assert ("free", 0) not in binding.events
+    next_work = schedule(runner, step=2)
+    assert next_work.native_target.grants[0].request.generation == 2
+    runner.execute_model(next_work)
+    assert runner.sample_tokens(None).native_target.committed_ends == (("0", 3),)
+    runner.shutdown()
+
+
+def test_stream_rejects_partial_acceptance_and_revokes_without_publication(binding):
+    runner = stream_ready(binding)
+    work = stream_work(runner)
+    runner.execute_model(work)
+    binding.accepted = (1,)
+    with pytest.raises(RuntimeError, match="sampler"):
+        runner.sample_tokens(None)
+    assert not binding.backend.ends
+    assert not any(
+        isinstance(event, tuple) and event[0] == "commit" for event in binding.events
+    )
+    with pytest.raises(RuntimeError, match="ready"):
+        runner.execute_model(work)
+    runner.shutdown()
+
+
+def test_stream_cannot_share_step_or_enter_when_opt_in_is_absent(binding):
+    runner = stream_ready(binding)
+    work = schedule(runner, lanes=2)
+    grants = list(work.native_target.grants)
+    grants[0] = replace(grants[0], phase="encoder_stream", chunk_rows=80)
+    work.native_target = replace(work.native_target, grants=tuple(grants))
+    with pytest.raises(ValueError):
+        runner.execute_model(work)
+    work.native_target = replace(work.native_target, grants=(grants[0],))
+    runner.config.additional_config["afd_native_target"]["prefill_mode"] = "full_target"
+    with pytest.raises(ValueError):
+        runner.execute_model(work)
+    assert not binding.backend.active
+    runner.shutdown()
+
+
+def test_stream_execution_failure_revokes_and_requires_a_new_owner_scope(binding):
+    runner = stream_ready(binding)
+    work = stream_work(runner)
+    binding.backend.fail_execute = True
+    with pytest.raises(RuntimeError, match="rank failed"):
+        runner.execute_model(work)
+    assert not binding.backend.ends
+    with pytest.raises(RuntimeError, match="not ready"):
+        runner.admit(0, 2)
+    runner.shutdown()
+
+
+def test_stream_consumer_timeout_retains_both_contexts_until_drain(binding):
+    runner = stream_ready(binding)
+    work = stream_work(runner)
+    runner.execute_model(work)
+    binding.backend.fail_drain = True
+    with pytest.raises(RuntimeError, match="consumer"):
+        runner.cancel_step()
+    assert binding.backend.active
+    assert binding.backend.ends
+    with pytest.raises(RuntimeError, match="still active"):
+        runner.execute_model(work)
+    binding.backend.fail_drain = False
+    runner.cancel_step()
+    assert not binding.backend.active
+    assert not binding.backend.ends
+    runner.shutdown()

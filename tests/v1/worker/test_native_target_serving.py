@@ -38,13 +38,13 @@ from vllm.v1.worker.native_target_binding import (
 from vllm.v1.worker.native_target_sampler import NativeVllmSampler
 
 
-def config(slots=2, batch=4):
+def config(slots=2, batch=4, max_context=64):
     return SimpleNamespace(
         additional_config={
             "afd_native_target": {"slots": slots, "batch_tokens": batch}
         },
         model_config=SimpleNamespace(
-            max_model_len=64,
+            max_model_len=max_context,
             logprobs_mode="raw_logprobs",
             use_fp64_gumbel=False,
             get_vocab_size=lambda: 8,
@@ -68,14 +68,15 @@ def request(name="a", prompt=(1, 2, 3), **kwargs):
 class Bank:
     """Finite token credits for queue tests; no claim about native page geometry."""
 
-    def __init__(self, capacity=128):
+    def __init__(self, capacity=128, batch=4):
         self.capacity = capacity
+        self.batch = batch
         self.ends, self.generations = {}, {}
         self.events = []
 
     def info(self):
         free = self.capacity - sum(self.ends.values())
-        return NativeCacheInfo(17, 4, (self.capacity,) * 4, (free,) * 4, 4096)
+        return NativeCacheInfo(17, self.batch, (self.capacity,) * 4, (free,) * 4, 4096)
 
     def rpc(self, name, args=()):
         self.events.append((name, args))
@@ -270,6 +271,81 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(result.finished)
 
 
+class StreamingSchedulerTests(unittest.TestCase):
+    finish_step = SchedulerTests.finish_step
+
+    def setUp(self):
+        self.bank = Bank(capacity=2048, batch=80)
+        cfg = config(batch=80, max_context=1024)
+        cfg.additional_config["afd_native_target"]["prefill_mode"] = "encoder_stream"
+        self.scheduler = NativeScheduler(
+            cfg,
+            SimpleNamespace(collective_rpc=self.bank.rpc),
+            self.bank.info(),
+            None,
+        )
+
+    def test_whole_prompt_envelope_is_distinct_from_internal_chunk_budget(self):
+        req = request(prompt=tuple(i % 7 for i in range(370)))
+        self.scheduler.add_request(req)
+        work = self.scheduler.schedule()
+        (grant,) = work.native_target.grants
+        self.assertEqual(grant.phase, "encoder_stream")
+        self.assertEqual(grant.chunk_rows, 80)
+        self.assertEqual(grant.selected, (369,))
+        self.assertEqual(work.total_num_scheduled_tokens, 370)
+        self.assertGreater(370, self.scheduler.token_budget)
+        self.assertEqual(req.num_computed_tokens, 0)
+        result = self.finish_step(work)[0].outputs[0]
+        self.assertEqual(req.num_computed_tokens, 370)
+        self.assertEqual(result.prefill_stats.num_prompt_tokens, 370)
+        self.assertEqual(result.prefill_stats.num_cached_tokens, 0)
+        self.assertEqual(result.new_token_ids, [5])
+
+    def test_two_requests_prefill_exclusively_then_both_decode(self):
+        for name in "ab":
+            self.scheduler.add_request(request(name))
+        first = self.scheduler.schedule()
+        self.assertEqual(list(first.num_scheduled_tokens), ["a"])
+        self.finish_step(first)
+        second = self.scheduler.schedule()
+        self.assertEqual(list(second.num_scheduled_tokens), ["b"])
+        self.assertEqual(second.native_target.grants[0].phase, "encoder_stream")
+        self.finish_step(second)
+        third = self.scheduler.schedule()
+        self.assertEqual(list(third.num_scheduled_tokens), ["a", "b"])
+        self.assertTrue(
+            all(g.phase == "full_target" for g in third.native_target.grants)
+        )
+        self.finish_step(third)
+        self.assertFalse(self.bank.ends)
+
+    def test_decode_round_cannot_accidentally_share_context_with_fresh_stream(self):
+        self.scheduler.add_request(request("a", max_tokens=4))
+        self.finish_step(self.scheduler.schedule())
+        self.scheduler.add_request(request("b"))
+        decode = self.scheduler.schedule()
+        self.assertEqual(list(decode.num_scheduled_tokens), ["a"])
+        self.finish_step(decode)
+        fresh = self.scheduler.schedule()
+        self.assertEqual(list(fresh.num_scheduled_tokens), ["b"])
+        self.assertEqual(fresh.native_target.grants[0].phase, "encoder_stream")
+
+    def test_recompute_with_existing_output_uses_bounded_full_target_grants(self):
+        req = request(prompt=tuple(i % 7 for i in range(370)), max_tokens=4)
+        self.scheduler.add_request(req)
+        self.finish_step(self.scheduler.schedule())
+        self.scheduler.reset_prefix_cache(reset_running_requests=True)
+        work = self.scheduler.schedule()
+        (grant,) = work.native_target.grants
+        self.assertEqual(grant.phase, "full_target")
+        self.assertEqual(len(grant.tokens), 80)
+        self.assertEqual(req.num_computed_tokens, 0)
+        self.assertFalse(
+            self.finish_step(work).get(0, SimpleNamespace(outputs=[])).outputs
+        )
+
+
 class SamplerTests(unittest.TestCase):
     def setUp(self):
         # Avoid invoking a compiler in this bounded CPU gate; the underlying
@@ -383,9 +459,23 @@ class SamplerTests(unittest.TestCase):
         )
 
     def test_scheduler_runner_sampler_two_context_lifecycle(self):
-        bank, events, tickets = Bank(), [], {}
+        self._native_flow("full_target")
+
+    def test_stream_scheduler_runner_sampler_replay_publication_and_queue(self):
+        self._native_flow("encoder_stream")
+
+    def _native_flow(self, mode):
+        streaming = mode == "encoder_stream"
+        cfg = config(batch=80 if streaming else 4, max_context=1024)
+        cfg.additional_config["afd_native_target"]["prefill_mode"] = mode
+        sampler = NativeVllmSampler(cfg, torch.device("cpu"))
+        bank = Bank(capacity=2048, batch=80 if streaming else 4)
+        events, tickets = [], {}
 
         def submit(grant):
+            if grant.phase == "encoder_stream":
+                self.assertFalse(tickets)
+                self.assertEqual(bank.ends[grant.request], 0)
             tickets[grant.request_id] = grant
             events.append(("submit", grant.request_id))
             return grant.request_id
@@ -418,10 +508,10 @@ class SamplerTests(unittest.TestCase):
             close=lambda: None,
         )
         runner = NativeTargetRunner(
-            config(),
+            cfg,
             "cpu",
             SimpleNamespace(
-                create_sampler=lambda *a: self.sampler,
+                create_sampler=lambda *a: sampler,
                 create_backend=lambda *a: backend,
             ),
             owner=17,
@@ -441,12 +531,13 @@ class SamplerTests(unittest.TestCase):
             return [getattr(runner, method)(*args)]
 
         scheduler = NativeScheduler(
-            config(), SimpleNamespace(collective_rpc=rpc), bank.info(), None
+            cfg, SimpleNamespace(collective_rpc=rpc), bank.info(), None
         )
         for name in "abc":
-            scheduler.add_request(request(name, max_tokens=2, logprobs=3))
+            prompt = tuple(i % 7 for i in range(370)) if streaming else (1, 2, 3)
+            scheduler.add_request(request(name, prompt, max_tokens=2, logprobs=3))
         outputs = []
-        for _ in range(5):
+        for _ in range(10):
             work = scheduler.schedule()
             result = runner.execute_model(work)
             if result is None:
@@ -460,9 +551,13 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(sum(item.finished for item in outputs), 3)
         self.assertFalse(bank.ends)
         self.assertFalse(tickets)
-        self.assertEqual(
-            events[:3], [("submit", "a"), ("submit", "b"), ("execute", ("a", "b"))]
-        )
+        if streaming:
+            self.assertEqual(events[:2], [("submit", "a"), ("execute", ("a",))])
+            self.assertEqual([item.request_id for item in outputs], list("ababcc"))
+        else:
+            self.assertEqual(
+                events[:3], [("submit", "a"), ("submit", "b"), ("execute", ("a", "b"))]
+            )
 
 
 class ClientMappingTests(unittest.TestCase):
@@ -477,6 +572,34 @@ class ClientMappingTests(unittest.TestCase):
         )
         backend = NativeClientBackend(SimpleNamespace(info=lambda: info))
         self.assertEqual(backend.info().cache_bytes, 9999)
+
+    def test_stream_cancel_reports_native_revocation_without_second_release(self):
+        request = SimpleNamespace(owner=17, slot=0, generation=1)
+        ticket = SimpleNamespace(request=request)
+        client = SimpleNamespace(
+            pending_commands=(), active_tickets=(ticket,), active_requests=(request,)
+        )
+
+        def cancel(value):
+            self.assertIs(value, ticket)
+            client.active_tickets = client.active_requests = ()
+
+        client.cancel = cancel
+        self.assertTrue(NativeClientBackend(client).cancel(ticket))
+
+    def test_lost_commit_ack_recovery_does_not_report_request_revoked(self):
+        request = SimpleNamespace(owner=17, slot=0, generation=1)
+        ticket = SimpleNamespace(request=request)
+        client = SimpleNamespace(
+            pending_commands=(7,), active_tickets=(ticket,), active_requests=(request,)
+        )
+
+        def wait(command):
+            self.assertEqual(command, 7)
+            client.active_tickets = ()
+
+        client.wait = wait
+        self.assertFalse(NativeClientBackend(client).cancel(ticket))
 
 
 class BindingTests(unittest.TestCase):
@@ -516,6 +639,13 @@ class BindingTests(unittest.TestCase):
     def test_wrong_checkpoint_geometry_rejected_before_construction(self):
         self.config.model_config.hf_config.hidden_size = 4096
         with self.assertRaisesRegex(ValueError, "geometry"):
+            self.binding.validate_config(self.config)
+
+    def test_encoder_stream_rejects_smaller_than_native_minimum_chunk_budget(self):
+        options = self.config.additional_config["afd_native_target"]
+        options["prefill_mode"] = "encoder_stream"
+        self.config.scheduler_config.max_num_batched_tokens = 79
+        with self.assertRaisesRegex(ValueError, "chunk budget"):
             self.binding.validate_config(self.config)
 
     def test_ordinary_kv_budget_or_sampling_mask_is_not_silently_ignored(self):

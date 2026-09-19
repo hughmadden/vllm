@@ -59,6 +59,7 @@ class NativeClientBackend:
             self.client.wait(command)
         if ticket in self.client.active_tickets:
             self.client.cancel(ticket)
+        return ticket.request not in self.client.active_requests
 
     def release(self, request):
         self.client.release(request)
@@ -86,6 +87,7 @@ class RetainedNativeBinding:
         if not required <= options.keys() or options.keys() - required - {
             "timeout_s",
             "poll_interval_s",
+            "prefill_mode",
         }:
             raise ValueError(
                 "native retained binding needs explicit artifacts, peers "
@@ -93,6 +95,13 @@ class RetainedNativeBinding:
             )
         if options["implementation"] != "retained":
             raise ValueError("unknown native target implementation")
+        mode = options.get("prefill_mode", "full_target")
+        if mode not in ("full_target", "encoder_stream"):
+            raise ValueError("unknown native prefill mode")
+        if mode == "encoder_stream" and (
+            config.scheduler_config.max_num_batched_tokens < 80
+        ):
+            raise ValueError("native encoder stream requires an 80-row chunk budget")
         for name in ("abi_library", "snapshot", "native_lib"):
             path = Path(options[name])
             if not path.is_absolute() or not path.exists():

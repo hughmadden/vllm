@@ -14,9 +14,9 @@ each process. No general plugin metadata or legacy `VLLM_AFD` transport hook is
 required. Alternate bindings can explicitly register before selection. An enabled
 selection without a binding rejects before executor construction.
 
-Use package client `dff621bd3ef760b1adc95405ba9a634419ab5d42`, including the
-Torch 2.14 CUDA array-interface correction; the actual
-native target C ABI begins at Rust `0dad275cc8fd2a2619203f861345d9cd835c8b91`.
+Use package client `2174292f705743dda54b20f177dd1f3206d4ad2e`, including the
+Torch 2.14 CUDA array-interface correction and encoder-stream support, with Rust
+target C ABI `4ec58286ea357fd306b0780861b79d502ebdca84`.
 Compatible descendants may extend this interface. This binding
 uses the actual `NativeBank` / `TargetContext` ownership, never the independent
 schema-1 `CacheCommands` prototype. Its earlier cross-language tests concern
@@ -31,6 +31,7 @@ JSON, with example paths and addresses that must be replaced for deployment:
 {"afd_native_target": {
   "enabled": true,
   "implementation": "retained",
+  "prefill_mode": "full_target",
   "abi_library": "/artifacts/libds41rt_daemon.so",
   "snapshot": "/weights/native-ds41",
   "native_lib": "/artifacts/libds41rt_native.so",
@@ -120,13 +121,51 @@ Worker calls serialize under a lock, preventing cancellation from freeing sample
 storage. Responsive mid-kernel abort and asynchronous engine scheduling remain
 outside this first binding.
 
+## Native encoder streaming opt-in
+
+Set `prefill_mode="encoder_stream"` explicitly to send each fresh text prompt
+through the retained native encoder-stream/final-window replay path. Omission
+keeps `full_target` for the comparison. Decode continues using full-target grants.
+Recompute after tokens have already been emitted also uses bounded full-target
+chunks; native prefix restoration and continuation streaming are not implied.
+
+The scheduler issues one lane-0 grant containing **all N prompt tokens**, expected
+committed end zero, absolute selected row `(N-1,)`, and `chunk_rows` equal to the
+smaller of native `batch_tokens` and the vLLM scheduler token budget. The resulting
+chunk size must be at least 80. Both contexts are exclusively owned by this grant
+until final replay, sampler completion and native publication. A pending decode
+step can run before the stream; it never shares the stream's contexts. Rotation
+puts the next waiting fresh prefill ahead of the prior request's decode, then
+ordinary two-context decode resumes. This first mode can delay unrelated decode
+for the duration of a long prefill; it does not claim fine-grained fairness.
+
+`num_scheduled_tokens` and `total_num_scheduled_tokens` report N, even when N is
+larger than `max_num_batched_tokens`. That field is the native command's whole
+token grant; `chunk_rows` separately bounds each internal GPU chunk. The Python
+scheduler does not pretend N tokens were already computed. Native owns internal
+encoder publication fences, suffix capture and layers20–39 replay over the final
+128-token window. The selected last-row logits produce exactly one next token.
+Only the completed full-N commit advances the request's computed end and emits
+that token; partial acceptance is rejected before any native commit.
+
+Native cancellation at any stream stage revokes the whole admission. The client
+validates `revoked:true`; the runner retains this receipt so scheduler retirement
+does not release the stale request a second time. A new admission gets a new
+generation. A consumer-event timeout retains the borrow and both contexts until
+drain succeeds. A failed execution/publication poisons the owner rather than
+silently re-entering with partially published encoder state. Cached-token usage
+remains zero: internal source publication is not a complete-model prefix hit.
+
+The stream retains up to approximately 5 MiB of additional suffix CUDA storage.
+Include this in the measured memory plan beyond the source payload budget.
+
 ## Remaining qualification
 
 - Run GPU startup and strict C1/C2 numerical gates, including mixed request
   histories and top-k/logprob invariance. Expert repeatability and standalone
   native smoke results do not waive the complete vLLM gate.
-- Bind the native encoder-stream/final-replay facade for long fresh prefill;
-  consecutive full-target chunks are not that optimized execution schedule.
+- Run the complete vLLM encoder-stream GPU path and compare token/logprob quality
+  and long-prefill throughput with the retained recipe and full-target path.
   dSpark requires its own accepted-prefix transaction integration afterward.
 - Complete model checkpoint lifecycle before enabling prefix hits. Source pages
   alone omit windows, compressor/Engram history and replay state.
@@ -134,11 +173,12 @@ outside this first binding.
 
 ## CPU checks
 
-`tests/v1/worker/test_native_target.py` runs 31 fake-backend cases. It executes the
+`tests/v1/worker/test_native_target.py` runs 43 fake-backend cases. It executes the
 actual Worker/EngineCore method bodies with CPU dependencies, tests constructor
 ordering/counts, cache failure, result ownership, cancellation, retained timeouts,
 publication errors and default-off behavior. Full GPU modules are not imported.
-Together with the prior cache adapter/Rust metadata contract suites, 58 tests pass
+Together with the two startup reset checks and prior cache adapter/Rust metadata
+contract suites, 72 tests pass
 without skips. Use the retained uv environment and explicit pytest paths:
 
 ```sh
@@ -147,7 +187,7 @@ PYTHONDONTWRITEBYTECODE=1 uv run --offline --no-project \
   tests/v1/worker/test_native_target.py -q
 ```
 
-`tests/v1/worker/test_native_target_serving.py` passes 22 cases using stdlib
+`tests/v1/worker/test_native_target_serving.py` passes 30 cases using stdlib
 `unittest` with real
 Torch and vLLM request/output/sampling modules in retained image
 `sha256:8041c897278b8372c15784d3a651c1cba689c24ccf6c12842ad3a7bf5b85abbe`.
@@ -156,6 +196,9 @@ mounts. Tests disable CUDA page locking and unwrap one compiled counting helper;
 sampler logic is upstream. They cover the integrated scheduler→runner→sampler
 loop, queue/credits, cached tokens zero, reset, cancellation, immutable logits,
 sampling parameters, seeded RNG and top-logprob invariance.
+Streaming cases also exercise whole-prompt versus chunk-budget accounting,
+exclusive-prefill/two-lane-decode queue progression, final replay publication,
+fresh generations, native cancellation receipts and lost-commit-ACK recovery.
 
 No dependencies were installed. Retained Ruff supplies scoped lint/format checks;
 full pre-commit is unavailable offline. The local environment lacks Torch/msgspec,
