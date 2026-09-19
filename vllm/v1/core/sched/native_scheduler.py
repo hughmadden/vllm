@@ -10,6 +10,7 @@ from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.request import RequestStatus
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.worker.native_target import (
     NativeCacheInfo,
     NativeGrant,
@@ -65,6 +66,8 @@ class NativeScheduler(SchedulerInterface):
         self.batch_tokens = min(options["batch_tokens"], cache_info.capacity_rows)
         self.token_budget = vllm_config.scheduler_config.max_num_batched_tokens
         self.prefill_mode = options.get("prefill_mode", "full_target")
+        self.draft_limit = (options.get("dspark") or {}).get("draft_limit", 0)
+        self._speculative_stats = None
         self.stream_chunk_rows = min(self.batch_tokens, self.token_budget)
         if self.prefill_mode == "encoder_stream" and self.stream_chunk_rows < 80:
             raise ValueError("native encoder stream needs at least 80 rows per chunk")
@@ -193,30 +196,53 @@ class NativeScheduler(SchedulerInterface):
                 )
                 if streaming and grants:
                     break  # The next round starts with this exclusive prefill.
+                params = request.sampling_params
+                speculative = (
+                    self.draft_limit > 0
+                    and start >= request.num_prompt_tokens
+                    and request.num_tokens - start == 1
+                    and not params.logit_bias
+                    and not params.min_p
+                )
                 count = (
                     request.num_prompt_tokens
                     if streaming
                     else min(request.num_tokens - start, self.batch_tokens, remaining)
                 )
+                if speculative:
+                    count = min(
+                        self.draft_limit + 1,
+                        self.batch_tokens,
+                        remaining,
+                        request.max_tokens - request.num_output_tokens,
+                        self.max_model_len - request.num_tokens,
+                    )
                 if count <= 0:
                     raise RuntimeError("native request has no granted input token")
-                tokens = tuple(request.all_token_ids[start : start + count])
+                tokens = tuple(
+                    request.all_token_ids[start : start + (1 if speculative else count)]
+                )
                 grant = NativeGrant(
                     request.request_id,
                     self.leases[request.request_id],
                     len(grants),
                     start,
                     tokens,
-                    (count - 1,),
+                    tuple(range(count)) if speculative else (count - 1,),
                     "prefill" if start < request.num_prompt_tokens else "decode",
                     0,
-                    phase="encoder_stream" if streaming else "full_target",
+                    phase="encoder_stream"
+                    if streaming
+                    else ("dspark" if speculative else "full_target"),
                     chunk_rows=self.stream_chunk_rows if streaming else None,
+                    verification_rows=count if speculative else 0,
                 )
                 grants.append(grant)
                 output.num_scheduled_tokens[request.request_id] = count
                 remaining = 0 if streaming else remaining - count
-                request.is_prefill_chunk = start + count < request.num_tokens
+                request.is_prefill_chunk = (
+                    not speculative and start + count < request.num_tokens
+                )
                 if request.request_id in self._new:
                     output.scheduled_new_reqs.append(
                         NewRequestData.from_request(
@@ -225,7 +251,7 @@ class NativeScheduler(SchedulerInterface):
                     )
                     self._new.remove(request.request_id)
             if grants and not self._can_prepare(
-                [(g.request, len(g.tokens)) for g in grants]
+                [(g.request, g.scheduled_rows) for g in grants]
             ):
                 raise RuntimeError("native capacity changed after logical admission")
             selected = {g.request_id for g in grants}
@@ -244,40 +270,74 @@ class NativeScheduler(SchedulerInterface):
             scheduler_output.native_target,
             model_runner_output.native_target,
         )
-        expected = tuple(
-            (g.request_id, g.committed_end + len(g.tokens)) for g in work.grants
-        )
         if (
             work != self._inflight
             or not isinstance(receipt, NativeStepResult)
             or receipt.owner != self.owner
             or receipt.step_id != work.step_id
-            or receipt.committed_ends != expected
+            or len(receipt.committed_ends) != len(work.grants)
             or model_runner_output.req_ids != [g.request_id for g in work.grants]
             or model_runner_output.req_id_to_index
             != {g.request_id: i for i, g in enumerate(work.grants)}
             or len(model_runner_output.sampled_token_ids) != len(work.grants)
         ):
             raise RuntimeError("invalid native publication acknowledgement")
+        if tuple(row[0] for row in receipt.speculative_counts) != tuple(
+            g.request_id for g in work.grants if g.phase == "dspark"
+        ):
+            raise RuntimeError("invalid native proposal counts")
+        proposed = {
+            name: (drafted, accepted)
+            for name, drafted, accepted in receipt.speculative_counts
+        }
+        ends = {}
+        for grant, (name, end) in zip(work.grants, receipt.committed_ends):
+            if name != grant.request_id or type(end) is not int:
+                raise RuntimeError("invalid native committed frontier")
+            accepted = end - grant.committed_end
+            if grant.phase == "dspark":
+                drafted, accepted_drafts = proposed[name]
+                if (
+                    type(drafted) is not int
+                    or type(accepted_drafts) is not int
+                    or not 1 <= accepted <= grant.verification_rows
+                    or not 0 <= accepted_drafts <= drafted < grant.verification_rows
+                    or accepted_drafts != accepted - 1
+                ):
+                    raise RuntimeError("invalid native speculative publication")
+            elif accepted != len(grant.tokens):
+                raise RuntimeError("invalid native committed frontier")
+            ends[name] = end
         # Validate every row before publishing any request in this step.
         for index, grant in enumerate(work.grants):
             request = self.requests.get(grant.request_id)
             if request is None or self.leases.get(grant.request_id) != grant.request:
                 continue
-            end = grant.committed_end + len(grant.tokens)
+            end = ends[grant.request_id]
             generated = model_runner_output.sampled_token_ids[index]
-            if len(generated) != (1 if end >= request.num_tokens else 0):
+            expected_count = (
+                end - grant.committed_end
+                if grant.phase == "dspark"
+                else (1 if end >= request.num_tokens else 0)
+            )
+            if len(generated) != expected_count:
                 raise RuntimeError(
                     "native sampling count disagrees with prefill boundary"
                 )
         self._receipt(receipt.cache_info)
+        self._speculative_stats = None
+        for drafted, accepted in proposed.values():
+            if drafted:
+                if self._speculative_stats is None:
+                    self._speculative_stats = SpecDecodingStats.new(self.draft_limit)
+                self._speculative_stats.observe_draft(drafted, accepted)
         self._inflight = None
         outputs, self._errors = self._errors, defaultdict(list)
         for index, grant in enumerate(work.grants):
             request = self.requests.get(grant.request_id)
             if request is None or self.leases.get(grant.request_id) != grant.request:
                 continue  # Aborted/preempted after GPU completion, before this ACK.
-            end = grant.committed_end + len(grant.tokens)
+            end = ends[grant.request_id]
             generated = model_runner_output.sampled_token_ids[index]
             request.num_computed_tokens = end
             for token in generated:
@@ -388,16 +448,17 @@ class NativeScheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.get_kv_cache_usage(),
             step_counter=self.current_step,
+            spec_decoding_stats=self._speculative_stats,
         )
 
     def get_grammar_bitmask(self, scheduler_output):
         return None
 
     def update_draft_token_ids(self, draft_token_ids):
-        raise ValueError("native speculation is not bound")
+        raise ValueError("native draft proposals are owned by the worker")
 
     def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output):
-        raise ValueError("native speculation is not bound")
+        raise ValueError("native draft proposals are owned by the worker")
 
     def reset_encoder_cache(self):
         return None

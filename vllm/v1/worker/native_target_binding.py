@@ -3,10 +3,12 @@
 """Production binding to the optional vllm-afd native target C ABI client."""
 
 import ipaddress
+import math
 from pathlib import Path
 
 from vllm.v1.worker.native_target import (
     NativeCacheInfo,
+    NativeProposal,
     NativeRequest,
     NativeTargetUnavailable,
 )
@@ -42,6 +44,12 @@ class NativeClientBackend:
 
     def submit(self, grant):
         return self.client.submit(grant)
+
+    def propose(self, grant):
+        proposal = self.client.submit_speculative(grant)
+        return NativeProposal(
+            proposal.ticket, tuple(proposal.tokens), proposal.draft_us
+        )
 
     def execute(self, tickets):
         self.client.execute(tickets)
@@ -88,6 +96,7 @@ class RetainedNativeBinding:
             "timeout_s",
             "poll_interval_s",
             "prefill_mode",
+            "dspark",
         }:
             raise ValueError(
                 "native retained binding needs explicit artifacts, peers "
@@ -102,6 +111,26 @@ class RetainedNativeBinding:
             config.scheduler_config.max_num_batched_tokens < 80
         ):
             raise ValueError("native encoder stream requires an 80-row chunk budget")
+        dspark = options.get("dspark")
+        if dspark is not None:
+            if (
+                not isinstance(dspark, dict)
+                or set(dspark) != {"draft_limit", "adaptive", "confidence_cutoff"}
+                or type(dspark["draft_limit"]) is not int
+                or not 1 <= dspark["draft_limit"] <= 5
+                or type(dspark["adaptive"]) is not bool
+                or options["slots"] < 2
+            ):
+                raise ValueError(
+                    "native dSpark needs explicit proposal limits and two slots"
+                )
+            cutoff = dspark["confidence_cutoff"]
+            if cutoff is not None and (
+                type(cutoff) not in (int, float)
+                or not math.isfinite(cutoff)
+                or not 0 < cutoff < 1
+            ):
+                raise ValueError("invalid native draft confidence cutoff")
         for name in ("abi_library", "snapshot", "native_lib"):
             path = Path(options[name])
             if not path.is_absolute() or not path.exists():
@@ -154,6 +183,8 @@ class RetainedNativeBinding:
             raise NativeTargetUnavailable(
                 "native target client lacks authoritative capacity queries"
             )
+        if dspark is not None and not hasattr(NativeTargetClient, "submit_speculative"):
+            raise NativeTargetUnavailable("native target client lacks dSpark proposals")
 
     def create_sampler(self, config, device):
         from vllm.v1.worker.native_target_sampler import NativeVllmSampler
@@ -180,6 +211,8 @@ class RetainedNativeBinding:
             )
         }
         target.update(owner=owner, max_context_tokens=config.model_config.max_model_len)
+        if options.get("dspark") is not None:
+            target["dspark"] = options["dspark"]
         return NativeClientBackend(
             NativeTargetClient(
                 target,

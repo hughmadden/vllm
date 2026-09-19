@@ -474,11 +474,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         }
         per_engine_labelvalues = self.per_engine_labelvalues
 
+        native_options = vllm_config.additional_config.get("afd_native_target", {})
+        native_drafts = (
+            (native_options.get("dspark") or {}).get("draft_limit", 0)
+            if native_options.get("enabled") is True
+            else 0
+        )
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config,
             labelnames,
             per_engine_labelvalues,
             is_diffusion=vllm_config.model_config.is_diffusion,
+            native_num_speculative_tokens=native_drafts,
         )
         self.kv_connector_prom = self._kv_connector_cls(
             vllm_config, labelnames, per_engine_labelvalues

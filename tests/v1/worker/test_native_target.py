@@ -163,6 +163,7 @@ class Binding:
         self.output_type = output_type
         self.fail_load = self.fail_sample = self.fail_scheduler = False
         self.accepted = None
+        self.generated = None
 
     def validate_config(self, config):
         self.events.append("validate")
@@ -193,7 +194,9 @@ class Binding:
             raise RuntimeError("sampler failed after launch")
         names = [g.request_id for g in grants]
         output = self.output_type(
-            names, dict(zip(names, range(len(names)))), [[7]] * len(names)
+            names,
+            dict(zip(names, range(len(names)))),
+            self.generated if self.generated is not None else [[7]] * len(names),
         )
         accepted = self.accepted or tuple(len(g.tokens) for g in grants)
         return native.NativeSample(output, accepted)

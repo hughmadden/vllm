@@ -10,7 +10,7 @@ It must never create the independent CacheCommands metadata prototype.
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -74,6 +74,18 @@ class NativeGrant:
     placement: int
     phase: str = "full_target"
     chunk_rows: int | None = None
+    verification_rows: int = 0
+
+    @property
+    def scheduled_rows(self) -> int:
+        return self.verification_rows if self.phase == "dspark" else len(self.tokens)
+
+
+@dataclass(frozen=True)
+class NativeProposal:
+    ticket: Any
+    tokens: tuple[int, ...]
+    draft_us: int
 
 
 @dataclass(frozen=True)
@@ -89,6 +101,7 @@ class NativeStepResult:
     step_id: int
     committed_ends: tuple[tuple[str, int], ...]
     cache_info: NativeCacheInfo
+    speculative_counts: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +133,10 @@ class NativeTargetBackend(Protocol):
 
         If a ticket cannot be returned, backend close must still drain its work.
         """
+        ...
+
+    def propose(self, grant: NativeGrant) -> NativeProposal:
+        """Return the native-owned anchor/drafts within the reserved envelope."""
         ...
 
     def execute(self, tickets: tuple[Any, ...]) -> None:
@@ -223,8 +240,8 @@ def get_native_target_binding(config: VllmConfig) -> NativeTargetBinding | None:
     ):
         raise NativeTargetUnavailable(
             "native target currently requires synchronous V2 generation with one "
-            "uni worker; prefixes, speculation, connectors, LoRA, sleep and parallel "
-            "workers are not bound"
+            "uni worker; prefixes, ordinary draft models, connectors, LoRA, sleep "
+            "and parallel workers are not bound"
         )
     if _binding is None and options.get("implementation") == "retained":
         from vllm.v1.worker.native_target_binding import RetainedNativeBinding
@@ -360,7 +377,7 @@ class NativeTargetRunner:
             raise ValueError("invalid native owner, sequence or grants")
         if output.scheduled_spec_decode_tokens or output.scheduled_encoder_inputs:
             raise NativeTargetUnavailable(
-                "native speculation and image work are unbound"
+                "ordinary scheduler draft tokens and image work are unbound"
             )
         info = self.cache_info()
         options = self.config.additional_config["afd_native_target"]
@@ -369,9 +386,12 @@ class NativeTargetRunner:
             streaming = (
                 isinstance(grant, NativeGrant) and grant.phase == "encoder_stream"
             )
+            speculative = isinstance(grant, NativeGrant) and grant.phase == "dspark"
             if (
                 not isinstance(grant, NativeGrant)
-                or grant.phase not in ("full_target", "encoder_stream")
+                or grant.phase not in ("full_target", "encoder_stream", "dspark")
+                or type(grant.verification_rows) is not int
+                or (not speculative and grant.verification_rows != 0)
                 or grant.kind not in ("prefill", "decode")
                 or not isinstance(grant.request, NativeRequest)
                 or grant.request.owner != self.owner
@@ -392,7 +412,7 @@ class NativeTargetRunner:
                 or not isinstance(grant.selected, tuple)
                 or not 1 <= len(grant.selected) <= 48
                 or any(
-                    type(i) is not int or not 0 <= i < len(grant.tokens)
+                    type(i) is not int or not 0 <= i < grant.scheduled_rows
                     for i in grant.selected
                 )
                 or tuple(sorted(set(grant.selected))) != grant.selected
@@ -420,10 +440,26 @@ class NativeTargetRunner:
                 or grant.selected[0] < max(0, len(grant.tokens) - 128)
             ):
                 raise ValueError("invalid or nonexclusive native encoder stream")
+            if speculative and (
+                not (options.get("dspark") or {}).get("draft_limit", 0)
+                or grant.kind != "decode"
+                or len(grant.tokens) != 1
+                or grant.committed_end <= 0
+                or not 1
+                <= grant.verification_rows
+                <= min(
+                    options["dspark"]["draft_limit"] + 1,
+                    info.capacity_rows,
+                    self.config.scheduler_config.max_num_batched_tokens,
+                    self.config.model_config.max_model_len - grant.committed_end - 1,
+                )
+                or grant.selected != tuple(range(grant.verification_rows))
+            ):
+                raise ValueError("invalid native speculative verification envelope")
             lanes.add(grant.lane)
             requests.add(grant.request)
             names.add(grant.request_id)
-        counts = {g.request_id: len(g.tokens) for g in work.grants}
+        counts = {g.request_id: g.scheduled_rows for g in work.grants}
         if (
             output.num_scheduled_tokens != counts
             or output.total_num_scheduled_tokens != sum(counts.values())
@@ -452,7 +488,31 @@ class NativeTargetRunner:
                         ),
                     )
                 for grant in work.grants:
-                    self._active.append(_Active(grant, backend.submit(grant)))
+                    if grant.phase == "dspark":
+                        proposal = backend.propose(grant)
+                        if not isinstance(proposal, NativeProposal):
+                            raise RuntimeError("invalid native proposal receipt")
+                        entry = _Active(grant, proposal.ticket)
+                        self._active.append(entry)
+                        if (
+                            not isinstance(proposal.tokens, tuple)
+                            or not 1 <= len(proposal.tokens) <= grant.verification_rows
+                            or proposal.tokens[0] != grant.tokens[0]
+                            or any(
+                                type(t) is not int or not 0 <= t < 2**32
+                                for t in proposal.tokens
+                            )
+                            or type(proposal.draft_us) is not int
+                            or not 0 <= proposal.draft_us < 2**64
+                        ):
+                            raise RuntimeError("native proposal exceeds owned envelope")
+                        entry.grant = replace(
+                            grant,
+                            tokens=proposal.tokens,
+                            selected=tuple(range(len(proposal.tokens))),
+                        )
+                    else:
+                        self._active.append(_Active(grant, backend.submit(grant)))
                 backend.execute(tuple(entry.ticket for entry in self._active))
                 for entry in self._active:
                     entry.logits = backend.acquire_logits(entry.ticket)
@@ -488,11 +548,16 @@ class NativeTargetRunner:
                     or sample.output.req_id_to_index
                     != {g.request_id: i for i, g in enumerate(grants)}
                     or len(sample.accepted) != len(grants)
+                    or len(sample.output.sampled_token_ids) != len(grants)
                     or any(
                         type(n) is not int
                         or not 0 <= n <= len(g.tokens)
                         or (g.phase == "encoder_stream" and n != len(g.tokens))
-                        for n, g in zip(sample.accepted, grants)
+                        or (
+                            g.phase == "dspark"
+                            and (n < 1 or len(sample.output.sampled_token_ids[i]) != n)
+                        )
+                        for i, (n, g) in enumerate(zip(sample.accepted, grants))
                     )
                 ):
                     raise RuntimeError("invalid native sampler result")
@@ -506,7 +571,15 @@ class NativeTargetRunner:
                         raise RuntimeError("native committed extent mismatch")
                     committed.append((entry.grant.request_id, end))
                 sample.output.native_target = NativeStepResult(
-                    self.owner, self._last_step, tuple(committed), self.cache_info()
+                    self.owner,
+                    self._last_step,
+                    tuple(committed),
+                    self.cache_info(),
+                    tuple(
+                        (g.request_id, len(g.tokens) - 1, n - 1)
+                        for g, n in zip(grants, sample.accepted)
+                        if g.phase == "dspark"
+                    ),
                 )
                 return sample.output
             except BaseException:

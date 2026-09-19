@@ -14,9 +14,9 @@ each process. No general plugin metadata or legacy `VLLM_AFD` transport hook is
 required. Alternate bindings can explicitly register before selection. An enabled
 selection without a binding rejects before executor construction.
 
-Use package client `2174292f705743dda54b20f177dd1f3206d4ad2e`, including the
-Torch 2.14 CUDA array-interface correction and encoder-stream support, with Rust
-target C ABI `4ec58286ea357fd306b0780861b79d502ebdca84`.
+Use package client `9bf0a2b6b80fe984776166ea5e2e3755fcbf577a`, including the
+Torch 2.14 CUDA array-interface correction, encoder stream and owned dSpark
+proposals, with Rust target C ABI `508f1909d7aff67f435786c07ef831d923512ffa`.
 Compatible descendants may extend this interface. This binding
 uses the actual `NativeBank` / `TargetContext` ownership, never the independent
 schema-1 `CacheCommands` prototype. Its earlier cross-language tests concern
@@ -103,8 +103,9 @@ The sampler uses vLLM's existing `Sampler` and built-in processors, preserving
 parameters, output histories, per-request RNG, penalties, min tokens, logit bias,
 min-p, top-k/top-p and output logprobs. Native FP32 logits are semantically read-only;
 upstream sampling mutates logits, so the zero-copy CUDA view is copied into two
-reusable GPU scratch rows. No full-vocabulary D2H copy is added. Every request is
-sampled as a one-row batch independent of its lane partner. The client binds each
+reusable GPU scratch planes (one row normally, at most six when dSpark is enabled).
+No full-vocabulary D2H copy is added. Every request is sampled independently of its
+lane partner. The client binds each
 lease to the current PyTorch CUDA stream. Native records/drains its completion
 event before commit or context reuse. Consumer timeout retains the borrow.
 
@@ -112,7 +113,8 @@ Request preprocessing rejects unsupported modes before the scheduler's serving
 loop: images/embeddings, structured output, priority, prompt/full-vocabulary or
 specific-token logprobs, trace replay, recurrent checkpoints, custom extra args,
 thinking-token budgets and streaming input. Configuration rejects vLLM parallel
-workers, async scheduling, prefixes, speculation, LoRA, connectors, sleep, custom
+workers, async scheduling, prefixes, ordinary vLLM draft-model configuration,
+LoRA, connectors, sleep, custom
 processors, routed-expert/sampling-mask outputs and ordinary KV memory budgets.
 
 Cancellation arriving during a synchronous step is processed after GPU completion
@@ -159,6 +161,53 @@ remains zero: internal source publication is not a complete-model prefix hit.
 The stream retains up to approximately 5 MiB of additional suffix CUDA storage.
 Include this in the measured memory plan beyond the source payload budget.
 
+## Native dSpark opt-in
+
+Add this object within `afd_native_target`; omission or null keeps target-only
+decoding. Both native slots are required; the configured limit is one to five.
+Keep ordinary `--speculative-config` unset: native owns the draft weights/windows.
+
+```json
+"dspark": {"draft_limit": 3, "adaptive": false, "confidence_cutoff": null}
+```
+
+After prefill, the already-emitted last token is the next uncomputed anchor.
+The scheduler grants a verification envelope E bounded by `draft_limit+1`,
+native row capacity, remaining step budget, remaining output budget and remaining
+context space including the replacement/bonus output. The single aggregate
+native capacity query includes E for each selected request. The worker then calls
+the retained native proposal primitive: its correlated command owns the request,
+generation, lane and expected end until it returns M≤E owned tokens containing
+the anchor and deterministic greedy drafts. Adaptive/confidence selection can
+shorten M. Only this native-owned proposal is executed, with all M rows selected.
+
+The existing vLLM `RejectionSampler` decides acceptance and replacement/bonus,
+using `draft_probs=None` because every native draft has probability one under its
+deterministic proposal distribution. Sampling constraints, request RNG and raw or
+processed top-k logprobs remain in vLLM. A one-row proposal uses its existing
+ordinary sampler. Requests with logit bias or min-p use target-only decoding:
+the retained upstream rejection implementation omits these processors on draft
+verification rows, so selecting that path would change requested semantics.
+
+The sampler trims at vLLM's token stop, EOS, repetition stop or output/context cap
+before native publication. C emitted outputs mean C accepted **input** rows:
+the anchor plus C−1 accepted drafts. The replacement/bonus is the next uncomputed
+anchor, never appended twice. After the native CUDA consumer fence, one joint
+commit publishes target, Engram and all three draft frontiers. The client verifies
+the independently reported target and draft ends. The scheduler advances computed
+tokens only from this ACK, records actual M−1 verified drafts and C−1 accepted
+drafts, and exports the ordinary speculative counters without creating an
+ordinary draft model. Text-string stops retain vLLM's frontend handling.
+
+Cancellation discards the speculative suffix and preserves the accepted frontier.
+Lost proposal replies stay owned by their original native command; client close
+handles pending-proposal cancellation and the completion race before releasing
+the request. No speculative output is published after a failed verification or
+joint commit. Full-target commits update draft windows too, and streaming final
+replay seeds them, allowing either prefill mode and the target-only fallback.
+Native joint commit currently synchronizes its publication work; overlap and
+net speedup require measurement, not inference from accepted counts.
+
 ## Remaining qualification
 
 - Run GPU startup and strict C1/C2 numerical gates, including mixed request
@@ -166,7 +215,10 @@ Include this in the measured memory plan beyond the source payload budget.
   native smoke results do not waive the complete vLLM gate.
 - Run the complete vLLM encoder-stream GPU path and compare token/logprob quality
   and long-prefill throughput with the retained recipe and full-target path.
-  dSpark requires its own accepted-prefix transaction integration afterward.
+- Run native dSpark through the complete GPU API path, comparing accepted-prefix
+  quality, C1/C2 invariance, stop/accounting and matched decode throughput against
+  target-only and retained Rust. CPU fake-kernel tests do not qualify CUDA
+  rejection kernels, the draft checkpoint or target/draft numerical agreement.
 - Complete model checkpoint lifecycle before enabling prefix hits. Source pages
   alone omit windows, compressor/Engram history and replay state.
 - Measure native memory, throughput and conservative admission's concurrency cost.
@@ -178,7 +230,7 @@ actual Worker/EngineCore method bodies with CPU dependencies, tests constructor
 ordering/counts, cache failure, result ownership, cancellation, retained timeouts,
 publication errors and default-off behavior. Full GPU modules are not imported.
 Together with the two startup reset checks and prior cache adapter/Rust metadata
-contract suites, 72 tests pass
+contract suites, 72 baseline tests pass
 without skips. Use the retained uv environment and explicit pytest paths:
 
 ```sh
@@ -187,7 +239,11 @@ PYTHONDONTWRITEBYTECODE=1 uv run --offline --no-project \
   tests/v1/worker/test_native_target.py -q
 ```
 
-`tests/v1/worker/test_native_target_serving.py` passes 30 cases using stdlib
+`tests/v1/worker/test_native_target_speculation.py` adds seven CPU cases for
+owned proposal bounds, adaptive shortening, cancellation, context/output limits
+and accepted-only publication. It uses the same fake-backend fixtures.
+
+`tests/v1/worker/test_native_target_serving.py` passes 46 cases using stdlib
 `unittest` with real
 Torch and vLLM request/output/sampling modules in retained image
 `sha256:8041c897278b8372c15784d3a651c1cba689c24ccf6c12842ad3a7bf5b85abbe`.
@@ -199,6 +255,13 @@ sampling parameters, seeded RNG and top-logprob invariance.
 Streaming cases also exercise whole-prompt versus chunk-budget accounting,
 exclusive-prefill/two-lane-decode queue progression, final replay publication,
 fresh generations, native cancellation receipts and lost-commit-ACK recovery.
+The dSpark cases run the real vLLM rejection-sampler orchestration while replacing
+only GPU kernel primitives with CPU tensor stubs. They cover greedy and stochastic
+unit-probability drafts, rejection/recovery/bonus, positional logprobs, stop
+trimming, actual proposal counts, native credits and full/stream prefill followed
+by two-context speculation with a third request queued. GPU performance is not
+represented by these stubs. Final retained CPU container:
+`afd-native-dspark-serving-cpu-v3`.
 
 No dependencies were installed. Retained Ruff supplies scoped lint/format checks;
 full pre-commit is unavailable offline. The local environment lacks Torch/msgspec,

@@ -224,12 +224,17 @@ class SpecDecodingProm:
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
         is_diffusion: bool = False,
+        native_num_speculative_tokens: int = 0,
     ):
         # Diffusion (dLLM) models reuse the spec-decode counters but expose them
         # under diffusion-native names; the per-position acceptance vector does
         # not apply, so it is omitted.
         self.is_diffusion = is_diffusion
-        self.spec_decoding_enabled = speculative_config is not None or is_diffusion
+        self.spec_decoding_enabled = (
+            speculative_config is not None
+            or is_diffusion
+            or native_num_speculative_tokens > 0
+        )
         if not self.spec_decoding_enabled:
             return
 
@@ -275,8 +280,11 @@ class SpecDecodingProm:
             int, list[prometheus_client.Counter]
         ] = {}
         if not is_diffusion:
-            assert speculative_config is not None
-            num_spec_tokens = speculative_config.num_speculative_tokens
+            num_spec_tokens = (
+                speculative_config.num_speculative_tokens
+                if speculative_config is not None
+                else native_num_speculative_tokens
+            )
             pos_labelnames = labelnames + ["position"]
             base_counter = self._counter_cls(
                 name="vllm:spec_decode_num_accepted_tokens_per_pos",

@@ -26,6 +26,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker.native_target import (
     NativeCacheInfo,
     NativeGrant,
+    NativeProposal,
     NativeRequest,
     NativeSchedule,
     NativeStepResult,
@@ -464,10 +465,16 @@ class SamplerTests(unittest.TestCase):
     def test_stream_scheduler_runner_sampler_replay_publication_and_queue(self):
         self._native_flow("encoder_stream")
 
-    def _native_flow(self, mode):
+    def _native_flow(self, mode, dspark=False):
         streaming = mode == "encoder_stream"
         cfg = config(batch=80 if streaming else 4, max_context=1024)
         cfg.additional_config["afd_native_target"]["prefill_mode"] = mode
+        if dspark:
+            cfg.additional_config["afd_native_target"]["dspark"] = {
+                "draft_limit": 3,
+                "adaptive": False,
+                "confidence_cutoff": None,
+            }
         sampler = NativeVllmSampler(cfg, torch.device("cpu"))
         bank = Bank(capacity=2048, batch=80 if streaming else 4)
         events, tickets = [], {}
@@ -481,8 +488,13 @@ class SamplerTests(unittest.TestCase):
             return grant.request_id
 
         def acquire(ticket):
+            rows = (
+                len(tickets[ticket].tokens) if tickets[ticket].phase == "dspark" else 1
+            )
             return SimpleNamespace(
-                tensor=torch.tensor([[0.0, 1.0, 3.0, 2.0, -2.0, -1.0, 0.5, 0.0]]),
+                tensor=torch.tensor(
+                    [[0.0, 1.0, 3.0, 2.0, -2.0, -1.0, 0.5, 0.0]]
+                ).repeat(rows, 1),
                 drain_consumers=lambda: events.append(("drain", ticket)),
                 close=lambda: events.append(("close", ticket)),
             )
@@ -494,12 +506,18 @@ class SamplerTests(unittest.TestCase):
             bank.ends[grant.request] += accepted
             return bank.ends[grant.request]
 
+        def propose(grant):
+            tokens = (*grant.tokens, *((2,) * (grant.verification_rows - 1)))
+            prepared = replace(grant, tokens=tokens, selected=tuple(range(len(tokens))))
+            return NativeProposal(submit(prepared), tokens, 1)
+
         backend = SimpleNamespace(
             info=bank.info,
             admit=lambda slot, seq: bank.rpc("native_admit", (slot, seq))[0],
             can_prepare=lambda work: bank.rpc("native_can_prepare", (work,))[0],
             committed_end=lambda req: bank.ends[req],
             submit=submit,
+            propose=propose,
             execute=lambda work: events.append(("execute", work)),
             acquire_logits=acquire,
             commit=commit,
@@ -535,7 +553,9 @@ class SamplerTests(unittest.TestCase):
         )
         for name in "abc":
             prompt = tuple(i % 7 for i in range(370)) if streaming else (1, 2, 3)
-            scheduler.add_request(request(name, prompt, max_tokens=2, logprobs=3))
+            scheduler.add_request(
+                request(name, prompt, max_tokens=5 if dspark else 2, logprobs=3)
+            )
         outputs = []
         for _ in range(10):
             work = scheduler.schedule()
@@ -547,7 +567,12 @@ class SamplerTests(unittest.TestCase):
             if not scheduler.has_requests():
                 break
         self.assertEqual(len(outputs), 6)
-        self.assertTrue(all(item.new_token_ids == [2] for item in outputs))
+        self.assertTrue(
+            all(item.new_token_ids == [2] * len(item.new_token_ids) for item in outputs)
+        )
+        if dspark:
+            self.assertEqual(sum(len(item.new_token_ids) for item in outputs), 15)
+            self.assertTrue(any(len(item.new_token_ids) == 4 for item in outputs))
         self.assertEqual(sum(item.finished for item in outputs), 3)
         self.assertFalse(bank.ends)
         self.assertFalse(tickets)
@@ -561,6 +586,16 @@ class SamplerTests(unittest.TestCase):
 
 
 class ClientMappingTests(unittest.TestCase):
+    def test_proposal_preserves_native_ticket_and_owned_tokens(self):
+        ticket = object()
+        client = SimpleNamespace(
+            submit_speculative=lambda grant: SimpleNamespace(
+                ticket=ticket, tokens=(1, 2), draft_us=9
+            )
+        )
+        proposal = NativeClientBackend(client).propose(object())
+        self.assertEqual(proposal, NativeProposal(ticket, (1, 2), 9))
+
     def test_actual_cache_total_is_preserved_independently_of_payload_budget(self):
         info = SimpleNamespace(
             owner=17,
@@ -636,6 +671,28 @@ class BindingTests(unittest.TestCase):
     def test_supported_configuration_validates_without_creating_native_owner(self):
         self.binding.validate_config(self.config)
 
+    def test_speculative_configuration_requires_typed_limits_and_matching_client(self):
+        options = self.config.additional_config["afd_native_target"]
+        good = {"draft_limit": 3, "adaptive": False, "confidence_cutoff": None}
+        for changed in (
+            {"draft_limit": 0},
+            {"draft_limit": True},
+            {"adaptive": 1},
+            {"confidence_cutoff": float("nan")},
+            {"unexpected": True},
+        ):
+            options["dspark"] = {**good, **changed}
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.binding.validate_config(self.config)
+        options["dspark"] = good
+        with self.assertRaisesRegex(RuntimeError, "lacks dSpark"):
+            self.binding.validate_config(self.config)
+        import sys
+
+        client = sys.modules["vllm_afd.native_target.client"].NativeTargetClient
+        client.submit_speculative = lambda grant: None
+        self.binding.validate_config(self.config)
+
     def test_wrong_checkpoint_geometry_rejected_before_construction(self):
         self.config.model_config.hf_config.hidden_size = 4096
         with self.assertRaisesRegex(ValueError, "geometry"):
@@ -656,6 +713,319 @@ class BindingTests(unittest.TestCase):
         self.config.model_config.return_sampling_mask = True
         with self.assertRaises(ValueError):
             self.binding.validate_config(self.config)
+
+
+class SpeculativeSchedulerTests(unittest.TestCase):
+    setUp = SchedulerTests.setUp
+    finish_step = SchedulerTests.finish_step
+
+    def prepare(self, **kwargs):
+        self.scheduler.draft_limit = 3
+        req = request(max_tokens=kwargs.pop("max_tokens", 8), **kwargs)
+        self.scheduler.add_request(req)
+        self.finish_step(self.scheduler.schedule())
+        return req
+
+    def test_verification_envelope_uses_native_credits_then_only_actual_end_advances(
+        self,
+    ):
+        req = self.prepare()
+        work = self.scheduler.schedule()
+        (grant,) = work.native_target.grants
+        self.assertEqual(
+            (grant.phase, grant.tokens, grant.verification_rows), ("dspark", (5,), 4)
+        )
+        self.assertEqual(work.num_scheduled_tokens, {"a": 4})
+        self.assertEqual(
+            self.bank.events[-1], ("native_can_prepare", (((grant.request, 4),),))
+        )
+        self.bank.ends[grant.request] += 2
+        output = ModelRunnerOutput(["a"], {"a": 0}, [[2, 4]])
+        output.native_target = NativeStepResult(
+            17,
+            work.native_target.step_id,
+            (("a", 5),),
+            self.bank.info(),
+            (("a", 2, 1),),
+        )
+        result = self.scheduler.update_from_output(work, output)[0]
+        self.assertEqual(req.num_computed_tokens, 5)
+        self.assertEqual(list(req.output_token_ids), [5, 2, 4])
+        stats = result.scheduler_stats.spec_decoding_stats
+        self.assertEqual((stats.num_draft_tokens, stats.num_accepted_tokens), (2, 1))
+        next_work = self.scheduler.schedule()
+        self.assertEqual(next_work.native_target.grants[0].tokens, (4,))
+        self.assertEqual(next_work.native_target.grants[0].committed_end, 5)
+
+    def test_output_and_context_limits_bound_anchor_only_fallback(self):
+        req = self.prepare(max_tokens=2)
+        work = self.scheduler.schedule()
+        self.assertEqual(work.native_target.grants[0].verification_rows, 1)
+        self.assertEqual(req.num_computed_tokens, 3)
+
+    def test_context_space_includes_the_replacement_token(self):
+        self.scheduler.max_model_len = 5
+        self.prepare()
+        self.assertEqual(
+            self.scheduler.schedule().native_target.grants[0].verification_rows, 1
+        )
+
+    def test_sampling_options_missing_from_upstream_rejection_use_target_only(self):
+        for option in ({"logit_bias": {2: 3.0}}, {"min_p": 0.1, "temperature": 0.8}):
+            with self.subTest(option=option):
+                self.setUp()
+                self.prepare(**option)
+                grant = self.scheduler.schedule().native_target.grants[0]
+                self.assertEqual(
+                    (grant.phase, grant.verification_rows), ("full_target", 0)
+                )
+
+    def test_bad_accepted_count_cannot_publish_any_output(self):
+        req = self.prepare()
+        work = self.scheduler.schedule()
+        output = ModelRunnerOutput(["a"], {"a": 0}, [[2]])
+        output.native_target = NativeStepResult(
+            17,
+            work.native_target.step_id,
+            (("a", 5),),
+            self.bank.info(),
+            (("a", 2, 1),),
+        )
+        with self.assertRaises(RuntimeError):
+            self.scheduler.update_from_output(work, output)
+        self.assertEqual(
+            (req.num_computed_tokens, list(req.output_token_ids)), (3, [5])
+        )
+
+    def test_native_metrics_count_verified_drafts_without_ordinary_draft_config(self):
+        from functools import partial
+
+        from prometheus_client import CollectorRegistry, Counter
+
+        from vllm.v1.spec_decode.metrics import SpecDecodingProm, SpecDecodingStats
+
+        registry = CollectorRegistry()
+        with patch.object(
+            SpecDecodingProm, "_counter_cls", partial(Counter, registry=registry)
+        ):
+            metrics = SpecDecodingProm(
+                None,
+                ["model", "engine"],
+                {0: ["native", "0"]},
+                native_num_speculative_tokens=3,
+            )
+        stats = SpecDecodingStats.new(3)
+        stats.observe_draft(2, 1)
+        metrics.observe(stats, 0)
+        samples = {
+            sample.name: sample.value
+            for metric in registry.collect()
+            for sample in metric.samples
+        }
+        self.assertEqual(samples["vllm:spec_decode_num_draft_tokens_total"], 2)
+        self.assertEqual(samples["vllm:spec_decode_num_accepted_tokens_total"], 1)
+
+
+class _CpuGreedyKernel:
+    """CPU stub for the GPU primitive; real RejectionSampler orchestrates it."""
+
+    def __getitem__(self, grid):
+        return self.run
+
+    def run(
+        self,
+        output,
+        ends,
+        drafts,
+        argmax,
+        bonus,
+        greedy,
+        limit,
+        uniform,
+        rates,
+        **kwargs,
+    ):
+        assert greedy is None and not kwargs["SYNTHETIC_MODE"]
+        start = 0
+        for row, end in enumerate(ends.tolist()):
+            for index in range(start, end):
+                output[row, index - start] = argmax[index]
+                if argmax[index] != drafts[index]:
+                    break
+            else:
+                output[row, end - start] = bonus[row, 0]
+            start = end
+
+
+class _CpuExpandKernel(_CpuGreedyKernel):
+    def run(self, output, values, ends, replace_from, replace_to, **kwargs):
+        start = 0
+        for value, end in zip(values, ends.tolist()):
+            output[start:end] = replace_to if value == replace_from else value
+            start = end
+
+
+class _CpuRecoveredKernel(_CpuGreedyKernel):
+    def run(
+        self, output, ends, drafts, draft_probs, target, inv_q, vocab, block, **kwargs
+    ):
+        assert draft_probs is None and kwargs["NO_DRAFT_PROBS"]
+        start = 0
+        for row, end in enumerate(ends.tolist()):
+            for index in range(start, end):
+                probabilities = target[index].clone()
+                probabilities[drafts[index]] = 0
+                output[index] = (probabilities * inv_q[row]).argmax()
+            start = end
+
+
+class _CpuRandomKernel(_CpuGreedyKernel):
+    def run(
+        self,
+        output,
+        ends,
+        drafts,
+        draft_probs,
+        target,
+        bonus,
+        recovered,
+        uniform,
+        greedy,
+        limit,
+        vocab,
+        rates,
+        **kwargs,
+    ):
+        assert draft_probs is None and kwargs["NO_DRAFT_PROBS"]
+        start = 0
+        for row, end in enumerate(ends.tolist()):
+            for index in range(start, end):
+                if uniform[index] >= target[index, drafts[index]]:
+                    output[row, index - start] = recovered[index]
+                    break
+                output[row, index - start] = drafts[index]
+            else:
+                output[row, end - start] = bonus[row, 0]
+            start = end
+
+
+class SpeculativeSamplerTests(unittest.TestCase):
+    def setUp(self):
+        SamplerTests.setUp(self)
+        import vllm.v1.sample.rejection_sampler as rejection
+
+        for name, implementation in (
+            ("rejection_greedy_sample_kernel", _CpuGreedyKernel()),
+            ("rejection_random_sample_kernel", _CpuRandomKernel()),
+            ("sample_recovered_tokens_kernel", _CpuRecoveredKernel()),
+            ("expand_kernel", _CpuExpandKernel()),
+        ):
+            kernel = patch.object(rejection, name, implementation)
+            kernel.start()
+            self.addCleanup(kernel.stop)
+        cfg = config(batch=4)
+        cfg.additional_config["afd_native_target"]["dspark"] = {
+            "draft_limit": 3,
+            "adaptive": False,
+            "confidence_cutoff": None,
+        }
+        self.sampler = NativeVllmSampler(cfg, "cpu")
+
+    def test_two_context_native_proposals_publish_and_release_through_actual_vllm(self):
+        SamplerTests._native_flow(self, "full_target", dspark=True)
+
+    def test_stream_prefill_then_native_speculation_preserves_queue_progress(self):
+        SamplerTests._native_flow(self, "encoder_stream", dspark=True)
+
+    def verify(self, drafts=(2, 3), winners=(2, 3, 4), **params):
+        req = request(max_tokens=params.pop("max_tokens", 8), logprobs=3, **params)
+        req.append_output_token_ids(5)  # Already emitted, not yet computed anchor.
+        new = SchedulerOutput.make_empty()
+        new.scheduled_new_reqs = [
+            NewRequestData.from_request(
+                req, (), prefill_token_ids=list(req.all_token_ids)
+            )
+        ]
+        self.sampler.update_requests(new)
+        grant = NativeGrant(
+            "a",
+            NativeRequest(17, 0, 1),
+            0,
+            3,
+            (5, *drafts),
+            tuple(range(len(drafts) + 1)),
+            "decode",
+            0,
+            phase="dspark",
+            verification_rows=len(drafts) + 1,
+        )
+        logits = torch.zeros(len(winners), 8)
+        for row, winner in enumerate(winners):
+            logits[row, winner] = 4
+        before = logits.clone()
+        result = self.sampler.sample((grant,), (SimpleNamespace(tensor=logits),), None)
+        self.assertTrue(torch.equal(before, logits))
+        return result, logits
+
+    def test_existing_rejection_sampler_accepts_prefix_and_bonus_with_row_logprobs(
+        self,
+    ):
+        result, logits = self.verify()
+        self.assertEqual(result.output.sampled_token_ids, [[2, 3, 4]])
+        self.assertEqual(result.accepted, (3,))
+        self.assertEqual(self.sampler.requests["a"].outputs, [5, 2, 3, 4])
+        expected = logits.log_softmax(-1)[range(3), [2, 3, 4]]
+        self.assertTrue(
+            torch.allclose(
+                torch.as_tensor(result.output.logprobs.logprobs[:, 0]), expected
+            )
+        )
+
+    def test_first_and_middle_rejection_keep_replacement_without_suffix(self):
+        for winners, expected in (((6, 3, 4), [6]), ((2, 6, 4), [2, 6])):
+            with self.subTest(winners=winners):
+                self.sampler.requests.clear()
+                result, _ = self.verify(winners=winners)
+                self.assertEqual(result.output.sampled_token_ids, [expected])
+                self.assertEqual(result.accepted, (len(expected),))
+                self.assertEqual(len(result.output.logprobs.logprobs), len(expected))
+
+    def test_stop_and_output_limit_trim_before_native_commit(self):
+        for params, expected in (
+            ({"stop_token_ids": [2]}, [2]),
+            ({"max_tokens": 3}, [2, 3]),
+            ({}, [2, 7]),
+        ):
+            with self.subTest(params=params):
+                self.sampler.requests.clear()
+                winners = (2, 3, 4) if params else (2, 7, 4)
+                drafts = (2, 3) if params else (2, 7)
+                result, _ = self.verify(drafts, winners, **params)
+                self.assertEqual(result.output.sampled_token_ids, [expected])
+                self.assertEqual(result.accepted, (len(expected),))
+
+    def test_anchor_only_proposal_uses_existing_sampler_without_zero_grid(self):
+        result, _ = self.verify(drafts=(), winners=(6,))
+        self.assertEqual(
+            (result.output.sampled_token_ids, result.accepted), ([[6]], (1,))
+        )
+
+    def test_min_tokens_constraints_apply_at_each_verified_position(self):
+        result, _ = self.verify(drafts=(7, 7), winners=(7, 7, 7), min_tokens=3)
+        self.assertEqual(result.output.sampled_token_ids, [[0]])
+        self.assertEqual(result.accepted, (1,))
+
+    def test_random_target_sampling_uses_unit_draft_probability_and_target_constraints(
+        self,
+    ):
+        for drafts, expected in (((2, 3), [2, 3, 4]), ((6, 3), [2])):
+            with self.subTest(drafts=drafts):
+                self.sampler.requests.clear()
+                result, _ = self.verify(
+                    drafts=drafts, temperature=0.8, top_k=1, seed=123
+                )
+                self.assertEqual(result.output.sampled_token_ids, [expected])
+                self.assertEqual(result.accepted, (len(expected),))
 
 
 if __name__ == "__main__":
