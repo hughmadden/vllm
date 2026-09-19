@@ -506,3 +506,13 @@ class NativeTargetRunner:
 
     def get_encoder_timing_stats(self):
         return {}
+
+    def reset_mm_cache(self) -> None:
+        # API startup invokes this even when multimodal inputs are unsupported.
+        with self._lock:
+            self._ready()
+
+    def reset_encoder_cache(self) -> None:
+        # This is vLLM's vision-output cache, not the native text cache bank.
+        with self._lock:
+            self._ready()
