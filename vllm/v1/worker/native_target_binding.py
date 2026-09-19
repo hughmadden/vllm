@@ -88,6 +88,18 @@ class NativeClientBackend:
         for command in self.client.pending_commands:
             self.client.wait(command)
         if ticket in self.client.active_tickets:
+            # Recovery can attach a logits lease to the client job after the
+            # runner's acquisition timed out. Rediscover this ticket's ownership
+            # and honor its consumer fence; leave other tickets' leases alone.
+            # Keep ownership recoverable if draining or closing raises.
+            lease = next(
+                (lease for lease in getattr(self.client, "active_leases", ())
+                 if lease.ticket == ticket),
+                None,
+            )
+            if lease is not None:
+                lease.drain_consumers()
+                lease.close()
             self.client.cancel(ticket)
         return ticket.request not in self.client.active_requests
 
