@@ -10,6 +10,7 @@ from vllm.v1.worker.native_target import (
     NativeBatchMember,
     NativeBatchProposal,
     NativeCacheInfo,
+    NativeCompositeRecovery,
     NativeProposal,
     NativeRequest,
     NativeTargetUnavailable,
@@ -17,12 +18,20 @@ from vllm.v1.worker.native_target import (
 
 
 class NativeClientBackend:
-    def __init__(self, client):
+    def __init__(self, client, *, enable_composite=False):
+        if type(enable_composite) is not bool:
+            raise ValueError("composite opt-in must be explicit boolean")
+        self._composite_enabled = enable_composite
         # Retain the asynchronous native owner before waiting for initialization.
         self.client = client
+        self._composite_pending = {}
+        self._composite_failures = {}
 
     def initialize(self):
         self.client.initialize()
+        negotiate = getattr(self.client, "negotiate_composite", None)
+        if self._composite_enabled and callable(negotiate):
+            negotiate()
 
     def info(self):
         info = self.client.info()
@@ -70,6 +79,63 @@ class NativeClientBackend:
         )
         return NativeBatchProposal(proposal.ticket, members, proposal.draft_us)
 
+    def can_drain_commit_batch(self, ticket, lease):
+        supported = getattr(self.client, "composite_supported", None)
+        return (
+            self._composite_enabled
+            and callable(supported) and supported() is True
+            and self.client.active_tickets == (ticket,)
+            and not self.client.pending_commands
+            and lease.ticket == ticket
+            and any(owned is lease for owned in self.client.active_leases)
+            and not self._composite_failures
+        )
+
+    def drain_commit_batch(self, ticket, lease, accepted):
+        from vllm_afd.errors import LeaseError
+        if not self._composite_enabled:
+            raise LeaseError("composite path is not explicitly enabled")
+        from vllm_afd.native_target.composite import CompositeFailure
+        from vllm_afd.native_target.client import NativeTargetTimeout
+
+        try:
+            return self.client.drain_commit_batch(lease, accepted)
+        except NativeTargetTimeout as error:
+            self._composite_pending[ticket] = error.command
+            raise
+        except CompositeFailure as error:
+            self._composite_failures[ticket] = error
+            raise
+
+    def recover_composite(self, ticket):
+        if not self._composite_pending and not self._composite_failures:
+            return None
+        if ticket not in self._composite_pending and ticket not in self._composite_failures:
+            return None
+        from vllm_afd.native_target.composite import CompositeFailure
+
+        if ticket in self._composite_pending:
+            command = self._composite_pending[ticket]
+            try:
+                self.client.wait(command)
+            except CompositeFailure as error:
+                del self._composite_pending[ticket]
+                self._composite_failures[ticket] = error
+            else:
+                # A successful typed parser return already proved consumption.
+                del self._composite_pending[ticket]
+                return NativeCompositeRecovery(True)
+        failure = self._composite_failures[ticket]
+        outcome = failure.outcome
+        if outcome.state == "quarantined":
+            return NativeCompositeRecovery(outcome.consumer_complete, failure)
+        del self._composite_failures[ticket]
+        if outcome.state == "cancelled" and outcome.consumer_complete:
+            return NativeCompositeRecovery(True)
+        if outcome.state == "lease_held" and not outcome.consumer_complete:
+            return NativeCompositeRecovery(False)
+        raise RuntimeError("unsupported composite recovery proof")
+
     def commit_batch(self, ticket, accepted):
         return self.client.commit_batch(ticket, accepted)
 
@@ -83,6 +149,9 @@ class NativeClientBackend:
         return self.client.commit(ticket, accepted)
 
     def cancel(self, ticket):
+        recovery = self.recover_composite(ticket)
+        if recovery is not None and recovery.failure is not None:
+            raise recovery.failure
         # A timed-out commit/submit still owns its original native command.
         # Recover its reply before deciding whether a ticket remains cancellable.
         for command in self.client.pending_commands:
@@ -113,8 +182,16 @@ class NativeClientBackend:
 
 
 class RetainedNativeBinding:
+    @staticmethod
+    def _composite_requested(options):
+        enabled = options.get("composite_drain_commit", False)
+        if type(enabled) is not bool:
+            raise ValueError("native composite_drain_commit must be boolean")
+        return enabled
+
     def validate_config(self, config):
         options = config.additional_config["afd_native_target"]
+        composite = self._composite_requested(options)
         required = {
             "enabled",
             "implementation",
@@ -129,9 +206,11 @@ class RetainedNativeBinding:
         if not required <= options.keys() or options.keys() - required - {
             "timeout_s",
             "poll_interval_s",
+            "execution_poll_interval_s",
             "prefill_mode",
             "dspark",
             "decode_batching",
+            "composite_drain_commit",
         }:
             raise ValueError(
                 "native retained binding needs explicit artifacts, peers "
@@ -139,6 +218,13 @@ class RetainedNativeBinding:
             )
         if options["implementation"] != "retained":
             raise ValueError("unknown native target implementation")
+        execution_interval = options.get("execution_poll_interval_s")
+        if execution_interval is not None and (
+            type(execution_interval) not in (int, float)
+            or not math.isfinite(execution_interval)
+            or not 0 < execution_interval <= 1
+        ):
+            raise ValueError("invalid native target execution poll interval")
         batching = options.get("decode_batching", False)
         if type(batching) is not bool:
             raise ValueError("native decode_batching must be boolean")
@@ -217,6 +303,15 @@ class RetainedNativeBinding:
             raise NativeTargetUnavailable(
                 "install the matching retained vllm-afd target client"
             ) from exc
+        if composite:
+            try:
+                from vllm_afd.native_target.composite import CompositeNativeTargetClient
+            except ImportError as exc:
+                raise NativeTargetUnavailable(
+                    "install the matching packaged composite-v1 client"
+                ) from exc
+            if not issubclass(CompositeNativeTargetClient, NativeTargetClient):
+                raise NativeTargetUnavailable("composite client has foreign base identity")
         if not hasattr(NativeTargetClient, "can_prepare"):
             raise NativeTargetUnavailable(
                 "native target client lacks authoritative capacity queries"
@@ -242,6 +337,12 @@ class RetainedNativeBinding:
         from vllm_afd.native_target.client import NativeTargetClient
 
         options = config.additional_config["afd_native_target"]
+        composite = self._composite_requested(options)
+        client_type = NativeTargetClient
+        if composite:
+            from vllm_afd.native_target.composite import CompositeNativeTargetClient
+
+            client_type = CompositeNativeTargetClient
         target = {
             name: options[name]
             for name in (
@@ -257,14 +358,16 @@ class RetainedNativeBinding:
         if options.get("dspark") is not None:
             target["dspark"] = options["dspark"]
         return NativeClientBackend(
-            NativeTargetClient(
+            client_type(
                 target,
                 enabled=True,
                 library_path=options["abi_library"],
                 timeout_s=options.get("timeout_s", 60),
                 poll_interval_s=options.get("poll_interval_s", 0.00005),
+                execution_poll_interval_s=options.get("execution_poll_interval_s"),
                 device_id=0,
-            )
+            ),
+            enable_composite=composite,
         )
 
     def create_scheduler(self, **kwargs):

@@ -129,6 +129,13 @@ class NativeStepResult:
 
 
 @dataclass(frozen=True)
+class NativeCompositeRecovery:
+    """Binding-validated cleanup decision, never an inferred bank frontier."""
+    consumer_complete: bool
+    failure: BaseException | None = None
+
+
+@dataclass(frozen=True)
 class NativeSample:
     output: ModelRunnerOutput
     accepted: tuple[int, ...]
@@ -667,6 +674,61 @@ class NativeTargetRunner:
                 entry.logits.close()
                 entry.logits = None
 
+    def _composite_eligible(self, backend):
+        if len(self._active) != 1:
+            return False
+        entry = self._active[0]
+        return (
+            entry.members is not None
+            and all(grant.phase == "full_target" for grant in entry.grants)
+            and entry.logits is not None
+            and callable(getattr(backend, "can_drain_commit_batch", None))
+            and backend.can_drain_commit_batch(entry.ticket, entry.logits)
+        )
+
+    def _sample_composite(self, backend, sample):
+        # Only reached after the original complete sampler-result validation.
+        entry = self._active[0]
+        accepted_by_request = dict(zip(self._request_order, sample.accepted))
+        accepted = tuple(accepted_by_request[g.request_id] for g in entry.grants)
+        ends = backend.drain_commit_batch(entry.ticket, entry.logits, accepted)
+        # Successful return is the bridge's validated consumer+commit proof.
+        entry.logits = None
+        self._active.pop(0)
+        if (
+            not isinstance(ends, tuple)
+            or len(ends) != len(entry.grants)
+            or any(
+                type(end) is not int or end != grant.committed_end + count
+                for end, grant, count in zip(ends, entry.grants, accepted)
+            )
+        ):
+            raise RuntimeError("native committed extent mismatch")
+        committed = {g.request_id: end for g, end in zip(entry.grants, ends)}
+        sample.output.native_target = NativeStepResult(
+            self.owner, self._last_step,
+            tuple((name, committed[name]) for name in self._request_order),
+            self.cache_info(),
+        )
+        return sample.output
+
+    def _recover_composites_before_drain(self):
+        recover = getattr(self._backend, "recover_composite", None)
+        if not callable(recover):
+            return
+        for entry in self._active:
+            recovery = recover(entry.ticket)
+            if recovery is None:
+                continue
+            if not isinstance(recovery, NativeCompositeRecovery):
+                raise RuntimeError("invalid composite recovery decision")
+            if recovery.consumer_complete:
+                entry.logits = None
+            if recovery.failure is not None:
+                # Quarantine keeps the step and native identities; do not guess
+                # cancellation/revocation from an unreadable native frontier.
+                raise recovery.failure
+
     def sample_tokens(self, grammar_output: GrammarOutput | None):
         from vllm.v1.outputs import ModelRunnerOutput
 
@@ -715,6 +777,8 @@ class NativeTargetRunner:
                     )
                 ):
                     raise RuntimeError("invalid native sampler result")
+                if self._composite_eligible(backend):
+                    return self._sample_composite(backend, sample)
                 self._drain_logits()
                 committed = {}
                 accepted_by_request = dict(zip(self._request_order, sample.accepted))
@@ -761,6 +825,7 @@ class NativeTargetRunner:
     def cancel_step(self) -> None:
         """Cancel this whole worker step; scheduler may regrant unaffected work."""
         with self._lock:
+            self._recover_composites_before_drain()
             self._drain_logits()
             while self._active:
                 assert self._backend is not None
