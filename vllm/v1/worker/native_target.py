@@ -353,6 +353,16 @@ class NativeTargetRunner:
         self._active: list[_Active] = []
         self._request_order: tuple[str, ...] = ()
         self._revoked: dict[int, NativeRequest] = {}
+        # p10 (p5-rpc-trim reuse): last frontier the daemon itself confirmed
+        # per live request: seeded by admit (zero), advanced only by
+        # already-validated commit replies, removed on revocation or release.
+        # committed_end is a pure daemon read and no other command mutates a
+        # committed frontier, so this mirror answers schedule validation
+        # without a per-grant committed_end RPC; capacity_rows is owner-static
+        # (daemon info() clones it), cached at load instead of a per-step
+        # info command.
+        self._frontiers: dict[NativeRequest, int] = {}
+        self._capacity_rows = 0
         self._last_step = 0
         self._loaded = self._failed = self._closed = False
         self._lock = RLock()
@@ -377,7 +387,11 @@ class NativeTargetRunner:
                 # before waiting for its one combined load/plan/cache-init ACK.
                 if initialize := getattr(self._backend, "initialize", None):
                     initialize()
-                self._backend.info().validate(self.owner)
+                info = self._backend.info()
+                info.validate(self.owner)
+                # p10: capacity_rows is owner-static; the schedule-validation
+                # capacity checks read this cached value (p5 trim).
+                self._capacity_rows = info.capacity_rows
                 self._loaded = True
             except BaseException:
                 self._failed = True
@@ -401,6 +415,7 @@ class NativeTargetRunner:
                 self._failed = True
                 raise RuntimeError("invalid native admission handle")
             self._revoked.pop(slot, None)
+            self._frontiers[request] = 0
             return request
 
     def release(self, request: NativeRequest) -> None:
@@ -415,8 +430,10 @@ class NativeTargetRunner:
             if self._revoked.get(request.slot) == request:
                 # Streaming cancellation already released the actual bank.
                 self._revoked.pop(request.slot)
+                self._frontiers.pop(request, None)
                 return
             backend.release(request)
+            self._frontiers.pop(request, None)
 
     def can_prepare(self, work):
         with self._lock:
@@ -440,7 +457,10 @@ class NativeTargetRunner:
             raise NativeTargetUnavailable(
                 "ordinary scheduler draft tokens and image work are unbound"
             )
-        info = self.cache_info()
+        # p10 (p5 trim): read-only capacity/floor checks run against
+        # owner-static capacity and the commit-confirmed frontier mirror: no
+        # info or per-grant committed_end commands on the validated step path.
+        capacity_rows = self._capacity_rows
         options = self.config.additional_config["afd_native_target"]
         if work.batching and options.get("decode_batching") is not True:
             raise ValueError("native decode batching is not enabled")
@@ -467,7 +487,7 @@ class NativeTargetRunner:
                 or (
                     not streaming
                     and (
-                        len(grant.tokens) > info.capacity_rows
+                        len(grant.tokens) > capacity_rows
                         or grant.chunk_rows is not None
                     )
                 )
@@ -482,7 +502,8 @@ class NativeTargetRunner:
                 or not 0 <= grant.placement < 2**64
                 or grant.request_id in output.finished_req_ids
                 or grant.request_id in (output.preempted_req_ids or ())
-                or grant.committed_end != backend.committed_end(grant.request)
+                or grant.committed_end
+                != self._known_end(backend, grant.request, grant.committed_end)
             ):
                 raise ValueError("invalid or unsupported native target grant")
             if streaming and (
@@ -496,7 +517,7 @@ class NativeTargetRunner:
                 or not 80
                 <= grant.chunk_rows
                 <= min(
-                    info.capacity_rows,
+                    capacity_rows,
                     options["batch_tokens"],
                     self.config.scheduler_config.max_num_batched_tokens,
                 )
@@ -512,7 +533,7 @@ class NativeTargetRunner:
                 <= grant.verification_rows
                 <= min(
                     options["dspark"]["draft_limit"] + 1,
-                    info.capacity_rows,
+                    capacity_rows,
                     self.config.scheduler_config.max_num_batched_tokens,
                     self.config.model_config.max_model_len - grant.committed_end - 1,
                 )
@@ -541,7 +562,7 @@ class NativeTargetRunner:
                     or len({g.phase for g in members}) != 1
                     or len({g.placement for g in members}) != 1
                     or sum(g.scheduled_rows for g in members)
-                    > min(info.capacity_rows, options["batch_tokens"])
+                    > min(capacity_rows, options["batch_tokens"])
                     or sum(len(g.selected) for g in members) > 48
                 ):
                     raise ValueError(
@@ -558,6 +579,22 @@ class NativeTargetRunner:
         ):
             raise ValueError("native tokens exceed or differ from scheduler grant")
         return work
+
+    def _known_end(self, backend, request: NativeRequest, presented: int) -> int:
+        # p10 (p5 trim): the commit-confirmed mirror answers for every
+        # request whose presented end matches it (the production path, zero
+        # RPCs: every presented end came from this runner's own published
+        # receipt). A presented end the mirror does not hold (foreign
+        # constructions that seeded daemon state out of band) is verified
+        # once against the authoritative read and the mirror self-heals to
+        # it; a true mismatch then fails this validation exactly like the
+        # pinned per-grant RPC.
+        known = self._frontiers.get(request)
+        if known == presented:
+            return known
+        actual = backend.committed_end(request)
+        self._frontiers[request] = actual
+        return actual
 
     def _submit_batch(self, members):
         assert self._backend is not None
@@ -602,6 +639,237 @@ class NativeTargetRunner:
             output_offset += len(member.selected)
         entry.members = tuple(resolved)
 
+    def _submit_split_supported(self, backend):
+        # p10: multi-lane steps overlap per-lane submits only when the
+        # bridge exposes the non-blocking publish/await split for singleton
+        # (submit/propose), grouped (submit_batch/propose_batch) entries and
+        # the result-scope splits (acquire, commit, commit_batch).
+        return all(
+            callable(getattr(backend, name, None))
+            for name in (
+                "begin_submit",
+                "finish_submit",
+                "begin_propose",
+                "finish_propose",
+                "begin_submit_batch",
+                "finish_submit_batch",
+                "begin_propose_batch",
+                "finish_propose_batch",
+                "begin_acquire_logits",
+                "finish_acquire_logits",
+                "begin_commit",
+                "finish_commit",
+                "begin_commit_batch",
+                "finish_commit_batch",
+            )
+        )
+
+    def _begin_lane_submits(self, backend, work):
+        # p10: SEND every lane's submit (speculative or not, grouped or
+        # singleton) before awaiting any prepared ACK. The daemon admits one
+        # pending command per lane slot (ffi/actor.rs reserve()), so both
+        # lanes' draft proposals queue on their own lane actors instead of
+        # the second lane waiting for the first lane's ACK. Per-entry
+        # manifest validation still runs in _finish_lane_submit, in send
+        # order, before execute_model proceeds to execute/acquire.
+        pending = []
+        try:
+            begun = set()
+            for grant in work.grants:
+                if work.batching:
+                    if grant.lane in begun:
+                        continue
+                    begun.add(grant.lane)
+                    members = tuple(g for g in work.grants if g.lane == grant.lane)
+                    first = members[0]
+                    group = NativeBatchGrant(first.lane, first.placement, members)
+                    if first.phase == "dspark":
+                        command = backend.begin_propose_batch(group)
+                        pending.append((grant, "batch_propose", members, command))
+                    else:
+                        command = backend.begin_submit_batch(group)
+                        pending.append((grant, "batch_submit", members, command))
+                    continue
+                if grant.phase == "dspark":
+                    pending.append(
+                        (grant, "propose", None, backend.begin_propose(grant))
+                    )
+                else:
+                    pending.append(
+                        (grant, "submit", None, backend.begin_submit(grant))
+                    )
+        except BaseException:
+            self._collect_lane_submits(backend, pending)
+            raise
+        return pending
+
+    def _resilient_submit_finish(self, backend, retry_begin, finish, command):
+        # p10 (F1 fix): a submission the daemon rejects with BUSY/NOT_READY
+        # never reached lane processing (ffi/actor.rs reserve()/control()
+        # reply without committing slot state; the encoder-stream scope is
+        # the documented BUSY source, p9 F1). Re-publishing the identical
+        # submission is therefore atomic. Retry transient rejections with a
+        # bounded backoff instead of letting one reply poison the whole
+        # worker (the MIXED crash class: one native error -> _failed=True ->
+        # engine dead for every remaining request).
+        from vllm_afd.native_target.client import (
+            NativeTargetError,
+            submit_rejection_retryable,
+        )
+
+        client = getattr(backend, "client", None)
+        clock = getattr(client, "_clock", None) or __import__("time").monotonic
+        sleep = getattr(client, "_sleep", None) or __import__("time").sleep
+        timeout = getattr(client, "timeout_s", 60) or 60
+        deadline = clock() + timeout
+        while True:
+            try:
+                return finish(command)
+            except NativeTargetError as error:
+                if not submit_rejection_retryable(error) or clock() >= deadline:
+                    raise
+                sleep(min(0.001, max(0.0, deadline - clock())))
+                command = retry_begin()
+
+    def _finish_lane_submit(self, backend, grant, kind, members, command):
+        # Await one lane's prepared ACK and run that entry's manifest
+        # validation exactly where the serial loop ran it: after the entry
+        # is appended to _active, so a validation failure is recovered by
+        # the ordinary cancel_step path.
+        if kind == "propose":
+            proposal = self._resilient_submit_finish(
+                backend,
+                lambda: backend.begin_propose(grant),
+                backend.finish_propose,
+                command,
+            )
+            if not isinstance(proposal, NativeProposal):
+                raise RuntimeError("invalid native proposal receipt")
+            entry = _Active(grant, proposal.ticket)
+            self._active.append(entry)
+            if (
+                not isinstance(proposal.tokens, tuple)
+                or not 1 <= len(proposal.tokens) <= grant.verification_rows
+                or proposal.tokens[0] != grant.tokens[0]
+                or any(
+                    type(t) is not int or not 0 <= t < 2**32 for t in proposal.tokens
+                )
+                or type(proposal.draft_us) is not int
+                or not 0 <= proposal.draft_us < 2**64
+            ):
+                raise RuntimeError("native proposal exceeds owned envelope")
+            entry.grant = replace(
+                grant,
+                tokens=proposal.tokens,
+                selected=tuple(range(len(proposal.tokens))),
+            )
+            return entry
+        if kind == "submit":
+            entry = _Active(
+                grant,
+                self._resilient_submit_finish(
+                    backend,
+                    lambda: backend.begin_submit(grant),
+                    backend.finish_submit,
+                    command,
+                ),
+            )
+            self._active.append(entry)
+            return entry
+        if kind == "batch_propose":
+            group = NativeBatchGrant(members[0].lane, members[0].placement, members)
+            proposal = self._resilient_submit_finish(
+                backend,
+                lambda: backend.begin_propose_batch(group),
+                backend.finish_propose_batch,
+                command,
+            )
+            if not isinstance(proposal, NativeBatchProposal):
+                raise RuntimeError("invalid native batch proposal receipt")
+            entry = _Active(members[0], proposal.ticket, members=members)
+            self._active.append(entry)
+            if (
+                not isinstance(proposal.members, tuple)
+                or len(proposal.members) != len(members)
+                or type(proposal.draft_us) is not int
+                or not 0 <= proposal.draft_us < 2**64
+            ):
+                raise RuntimeError("invalid native batch proposal manifest")
+            resolved, input_offset, output_offset = [], 0, 0
+            for member_grant, member in zip(members, proposal.members):
+                if (
+                    not isinstance(member, NativeBatchMember)
+                    or member.request != member_grant.request
+                    or not isinstance(member.tokens, tuple)
+                    or not 1 <= len(member.tokens) <= member_grant.verification_rows
+                    or member.tokens[0] != member_grant.tokens[0]
+                    or any(type(t) is not int or not 0 <= t < 2**32 for t in member.tokens)
+                    or member.selected != tuple(range(len(member.tokens)))
+                    or type(member.input_offset) is not int
+                    or member.input_offset != input_offset
+                    or type(member.output_offset) is not int
+                    or member.output_offset != output_offset
+                ):
+                    raise RuntimeError(
+                        "invalid native batch proposal member or offsets"
+                    )
+                resolved.append(
+                    replace(
+                        member_grant, tokens=member.tokens, selected=member.selected
+                    )
+                )
+                input_offset += len(member.tokens)
+                output_offset += len(member.selected)
+            entry.members = tuple(resolved)
+            return entry
+        group = NativeBatchGrant(members[0].lane, members[0].placement, members)
+        ticket = self._resilient_submit_finish(
+            backend,
+            lambda: backend.begin_submit_batch(group),
+            backend.finish_submit_batch,
+            command,
+        )
+        entry = _Active(members[0], ticket, members=members)
+        self._active.append(entry)
+        return entry
+
+    def _collect_lane_submits(self, backend, remaining):
+        # Failure path: every already-SENT submit is collected so its ticket
+        # lands in _active and the existing cancel/recover path cancels it
+        # (daemon Cancel accepts prepared tickets, ffi/actor.rs reserve()).
+        # A collect that itself fails keeps its original client command
+        # pending for wait/cancel recovery — exactly the serial path's state
+        # for a failed or timed-out submit. Secondary failures never mask the
+        # primary error.
+        for grant, kind, members, command in remaining:
+            try:
+                self._finish_lane_submit(backend, grant, kind, members, command)
+            except BaseException:
+                continue
+
+    def _finish_lane_submits(self, backend, pending):
+        for index, (grant, kind, members, command) in enumerate(pending):
+            try:
+                self._finish_lane_submit(backend, grant, kind, members, command)
+            except BaseException:
+                self._collect_lane_submits(backend, pending[index + 1 :])
+                raise
+
+    def _acquire_lane_logits(self, backend):
+        # p10: publish every entry's logits acquisition before awaiting any
+        # descriptor (per-slot pending gate, disjoint tickets); fall back to
+        # the serial acquisition for split-less bridges.
+        if len(self._active) > 1 and self._submit_split_supported(backend):
+            published = [
+                (entry, backend.begin_acquire_logits(entry.ticket))
+                for entry in self._active
+            ]
+            for entry, command in published:
+                entry.logits = backend.finish_acquire_logits(command)
+            return
+        for entry in self._active:
+            entry.logits = backend.acquire_logits(entry.ticket)
+
     def execute_model(self, scheduler_output: SchedulerOutput):
         with self._lock:
             if self._active:
@@ -623,44 +891,57 @@ class NativeTargetRunner:
                             self.owner, self._last_step, (), self.cache_info()
                         ),
                     )
-                for grant in work.grants:
-                    if work.batching:
-                        if any(
-                            entry.grant.lane == grant.lane for entry in self._active
-                        ):
-                            continue
-                        self._submit_batch(
-                            tuple(g for g in work.grants if g.lane == grant.lane)
-                        )
-                        continue
-                    if grant.phase == "dspark":
-                        proposal = backend.propose(grant)
-                        if not isinstance(proposal, NativeProposal):
-                            raise RuntimeError("invalid native proposal receipt")
-                        entry = _Active(grant, proposal.ticket)
-                        self._active.append(entry)
-                        if (
-                            not isinstance(proposal.tokens, tuple)
-                            or not 1 <= len(proposal.tokens) <= grant.verification_rows
-                            or proposal.tokens[0] != grant.tokens[0]
-                            or any(
-                                type(t) is not int or not 0 <= t < 2**32
-                                for t in proposal.tokens
+                if len(work.grants) > 1 and self._submit_split_supported(backend):
+                    # p10: multi-lane step; every lane's submit is SENT
+                    # before any prepared ACK is awaited, then awaited in
+                    # send order (per-lane ordering and _active order
+                    # unchanged). Transient daemon rejections of an in-flight
+                    # submission (BUSY/NOT_READY, e.g. the encoder-stream
+                    # scope) are retried atomically; the MIXED-cell crash
+                    # class — one rejection -> _failed -> dead engine — is
+                    # closed by _resilient_submit_finish.
+                    self._finish_lane_submits(
+                        backend, self._begin_lane_submits(backend, work)
+                    )
+                else:
+                    for grant in work.grants:
+                        if work.batching:
+                            if any(
+                                entry.grant.lane == grant.lane
+                                for entry in self._active
+                            ):
+                                continue
+                            self._submit_batch(
+                                tuple(g for g in work.grants if g.lane == grant.lane)
                             )
-                            or type(proposal.draft_us) is not int
-                            or not 0 <= proposal.draft_us < 2**64
-                        ):
-                            raise RuntimeError("native proposal exceeds owned envelope")
-                        entry.grant = replace(
-                            grant,
-                            tokens=proposal.tokens,
-                            selected=tuple(range(len(proposal.tokens))),
-                        )
-                    else:
-                        self._active.append(_Active(grant, backend.submit(grant)))
+                            continue
+                        if grant.phase == "dspark":
+                            proposal = backend.propose(grant)
+                            if not isinstance(proposal, NativeProposal):
+                                raise RuntimeError("invalid native proposal receipt")
+                            entry = _Active(grant, proposal.ticket)
+                            self._active.append(entry)
+                            if (
+                                not isinstance(proposal.tokens, tuple)
+                                or not 1 <= len(proposal.tokens) <= grant.verification_rows
+                                or proposal.tokens[0] != grant.tokens[0]
+                                or any(
+                                    type(t) is not int or not 0 <= t < 2**32
+                                    for t in proposal.tokens
+                                )
+                                or type(proposal.draft_us) is not int
+                                or not 0 <= proposal.draft_us < 2**64
+                            ):
+                                raise RuntimeError("native proposal exceeds owned envelope")
+                            entry.grant = replace(
+                                grant,
+                                tokens=proposal.tokens,
+                                selected=tuple(range(len(proposal.tokens))),
+                            )
+                        else:
+                            self._active.append(_Active(grant, backend.submit(grant)))
                 backend.execute(tuple(entry.ticket for entry in self._active))
-                for entry in self._active:
-                    entry.logits = backend.acquire_logits(entry.ticket)
+                self._acquire_lane_logits(backend)
             except BaseException:
                 self._failed = True
                 self.cancel_step()
@@ -674,10 +955,39 @@ class NativeTargetRunner:
                 entry.logits.close()
                 entry.logits = None
 
+    def _drain_entries_pipelined(self):
+        # p10: publish every entry's consumer drain (release_logits) before
+        # awaiting any ACK; the daemon records the consumer fences
+        # concurrently. Falls back per-step to the serial drain when a lease
+        # does not expose the split (split-less bridges, fixture leases).
+        entries = [entry for entry in self._active if entry.logits is not None]
+        if not entries:
+            return
+        if not all(
+            callable(getattr(entry.logits, "begin_drain", None))
+            and callable(getattr(entry.logits, "finish_drain", None))
+            for entry in entries
+        ):
+            self._drain_logits()
+            return
+        published = [
+            (entry, entry.logits, entry.logits.begin_drain()) for entry in entries
+        ]
+        for entry, lease, command in published:
+            lease.finish_drain(command)
+            lease.close()
+            entry.logits = None
+
     def _composite_eligible(self, backend):
         if len(self._active) != 1:
             return False
         entry = self._active[0]
+        # The fused release_logits+commit route is daemon-gated to grouped
+        # FULL_TARGET batches only: ffi/actor.rs result_scope composite arm
+        # requires Acceptance::Batch (actor.rs:365) and rejects
+        # SpeculativeBatch with a LeaseHeld error, so grouped dSpark stays
+        # on the separate drain+commit path (daemon rule, mirrored by
+        # composite.py's batch_full_target phase check).
         return (
             entry.members is not None
             and all(grant.phase == "full_target" for grant in entry.grants)
@@ -704,6 +1014,9 @@ class NativeTargetRunner:
             )
         ):
             raise RuntimeError("native committed extent mismatch")
+        self._frontiers.update(
+            (g.request, end) for g, end in zip(entry.grants, ends)
+        )
         committed = {g.request_id: end for g, end in zip(entry.grants, ends)}
         sample.output.native_target = NativeStepResult(
             self.owner, self._last_step,
@@ -779,32 +1092,110 @@ class NativeTargetRunner:
                     raise RuntimeError("invalid native sampler result")
                 if self._composite_eligible(backend):
                     return self._sample_composite(backend, sample)
-                self._drain_logits()
+                # p10: publish every entry's consumer drain, then every
+                # entry's commit, before awaiting the replies; each ACK is
+                # still consumed in _active order and every validation is
+                # byte-for-byte the serial path's. On a mid-phase failure
+                # the still-in-flight peer commands are collected so their
+                # tickets resolve, then the ordinary cancel_step path
+                # recovers exactly the serial failure state.
+                self._drain_entries_pipelined()
                 committed = {}
                 accepted_by_request = dict(zip(self._request_order, sample.accepted))
-                while self._active:
-                    entry = self._active[0]
-                    accepted = tuple(
-                        accepted_by_request[g.request_id] for g in entry.grants
-                    )
-                    ends = (
-                        backend.commit_batch(entry.ticket, accepted)
-                        if entry.members is not None
-                        else (backend.commit(entry.ticket, accepted[0]),)
-                    )
-                    self._active.pop(0)
-                    if (
-                        not isinstance(ends, tuple)
-                        or len(ends) != len(entry.grants)
-                        or any(
-                            type(end) is not int or end != grant.committed_end + count
-                            for end, grant, count in zip(ends, entry.grants, accepted)
+                if len(self._active) > 1 and self._submit_split_supported(backend):
+                    published = []
+                    try:
+                        for entry in self._active:
+                            accepted = tuple(
+                                accepted_by_request[g.request_id]
+                                for g in entry.grants
+                            )
+                            command = (
+                                backend.begin_commit_batch(entry.ticket, accepted)
+                                if entry.members is not None
+                                else backend.begin_commit(
+                                    entry.ticket, accepted[0]
+                                )
+                            )
+                            published.append((entry, accepted, command))
+                    except BaseException:
+                        for entry, _, command in published:
+                            try:
+                                if entry.members is not None:
+                                    backend.finish_commit_batch(command)
+                                else:
+                                    backend.finish_commit(command)
+                            except BaseException:
+                                continue
+                        raise
+                    for index, (entry, accepted, command) in enumerate(published):
+                        try:
+                            ends = (
+                                backend.finish_commit_batch(command)
+                                if entry.members is not None
+                                else (backend.finish_commit(command),)
+                            )
+                        except BaseException:
+                            for peer, _, peer_command in published[index + 1 :]:
+                                try:
+                                    if peer.members is not None:
+                                        backend.finish_commit_batch(peer_command)
+                                    else:
+                                        backend.finish_commit(peer_command)
+                                except BaseException:
+                                    continue
+                            raise
+                        self._active.pop(0)
+                        if (
+                            not isinstance(ends, tuple)
+                            or len(ends) != len(entry.grants)
+                            or any(
+                                type(end) is not int
+                                or end != grant.committed_end + count
+                                for end, grant, count in zip(
+                                    ends, entry.grants, accepted
+                                )
+                            )
+                        ):
+                            raise RuntimeError("native committed extent mismatch")
+                        self._frontiers.update(
+                            (g.request, end)
+                            for g, end in zip(entry.grants, ends)
                         )
-                    ):
-                        raise RuntimeError("native committed extent mismatch")
-                    committed.update(
-                        (g.request_id, end) for g, end in zip(entry.grants, ends)
-                    )
+                        committed.update(
+                            (g.request_id, end) for g, end in zip(entry.grants, ends)
+                        )
+                else:
+                    while self._active:
+                        entry = self._active[0]
+                        accepted = tuple(
+                            accepted_by_request[g.request_id] for g in entry.grants
+                        )
+                        ends = (
+                            backend.commit_batch(entry.ticket, accepted)
+                            if entry.members is not None
+                            else (backend.commit(entry.ticket, accepted[0]),)
+                        )
+                        self._active.pop(0)
+                        if (
+                            not isinstance(ends, tuple)
+                            or len(ends) != len(entry.grants)
+                            or any(
+                                type(end) is not int
+                                or end != grant.committed_end + count
+                                for end, grant, count in zip(
+                                    ends, entry.grants, accepted
+                                )
+                            )
+                        ):
+                            raise RuntimeError("native committed extent mismatch")
+                        self._frontiers.update(
+                            (g.request, end)
+                            for g, end in zip(entry.grants, ends)
+                        )
+                        committed.update(
+                            (g.request_id, end) for g, end in zip(entry.grants, ends)
+                        )
                 sample.output.native_target = NativeStepResult(
                     self.owner,
                     self._last_step,
@@ -833,6 +1224,7 @@ class NativeTargetRunner:
                 if self._backend.cancel(entry.ticket):
                     for grant in entry.grants:
                         self._revoked[grant.request.slot] = grant.request
+                        self._frontiers.pop(grant.request, None)
                 self._active.pop(0)
 
     def shutdown(self):

@@ -54,19 +54,46 @@ class NativeClientBackend:
         return self.client.committed_end(request)
 
     def submit(self, grant):
-        return self.client.submit(grant)
+        return self.finish_submit(self.begin_submit(grant))
+
+    def begin_submit(self, grant):
+        # p10: non-blocking publish half of submit; the worker sends every
+        # lane's submit before awaiting any prepared ACK (daemon per-slot
+        # pending, ffi/actor.rs reserve()).
+        return self.client.begin_submit(grant)
+
+    def finish_submit(self, command):
+        return self.client.finish_submit(command)
 
     def propose(self, grant):
-        proposal = self.client.submit_speculative(grant)
+        return self.finish_propose(self.begin_propose(grant))
+
+    def begin_propose(self, grant):
+        return self.client.begin_submit_speculative(grant)
+
+    def finish_propose(self, command):
+        proposal = self.client.finish_submit_speculative(command)
         return NativeProposal(
             proposal.ticket, tuple(proposal.tokens), proposal.draft_us
         )
 
     def submit_batch(self, grant):
-        return self.client.submit_batch(grant)
+        return self.finish_submit_batch(self.begin_submit_batch(grant))
+
+    def begin_submit_batch(self, grant):
+        return self.client.begin_submit_batch(grant)
+
+    def finish_submit_batch(self, command):
+        return self.client.finish_submit_batch(command)
 
     def propose_batch(self, grant):
-        proposal = self.client.submit_speculative_batch(grant)
+        return self.finish_propose_batch(self.begin_propose_batch(grant))
+
+    def begin_propose_batch(self, grant):
+        return self.client.begin_submit_speculative_batch(grant)
+
+    def finish_propose_batch(self, command):
+        proposal = self.client.finish_submit_batch(command)
         members = tuple(
             NativeBatchMember(
                 NativeRequest(m.request.owner, m.request.slot, m.request.generation),
@@ -78,6 +105,38 @@ class NativeClientBackend:
             for m in proposal.members
         )
         return NativeBatchProposal(proposal.ticket, members, proposal.draft_us)
+
+    def acquire_logits(self, ticket):
+        return self.finish_acquire_logits(self.begin_acquire_logits(ticket))
+
+    def begin_acquire_logits(self, ticket):
+        # p10: publish half of acquire_logits; the worker publishes every
+        # entry's acquisition before awaiting any descriptor.
+        return self.client.begin_acquire_logits(ticket)
+
+    def finish_acquire_logits(self, command):
+        return self.client.finish_acquire_logits(command)
+
+    def commit(self, ticket, accepted):
+        return self.finish_commit(self.begin_commit(ticket, accepted))
+
+    def begin_commit(self, ticket, accepted):
+        # p10: publish half of commit; the worker publishes every entry's
+        # commit before awaiting any ACK.
+        return self.client.begin_commit(ticket, accepted)
+
+    def finish_commit(self, command):
+        return self.client.finish_commit(command)
+
+    def commit_batch(self, ticket, accepted):
+        return self.finish_commit_batch(self.begin_commit_batch(ticket, accepted))
+
+    def begin_commit_batch(self, ticket, accepted):
+        # p10: publish half of commit_batch; see begin_commit.
+        return self.client.begin_commit_batch(ticket, accepted)
+
+    def finish_commit_batch(self, command):
+        return self.client.finish_commit_batch(command)
 
     def can_drain_commit_batch(self, ticket, lease):
         supported = getattr(self.client, "composite_supported", None)
