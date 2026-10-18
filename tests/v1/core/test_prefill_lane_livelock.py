@@ -15,6 +15,11 @@ then preempted keep their last_scheduled_step lane rank. That rank must
 age out, and the post-waiting interleave pass must be able to preempt on
 a step that scheduled nothing (only while the connector is quiescent),
 or the frozen-rank pair starves the running chunks forever at free == 0.
+
+With mamba "align" cache mode, a lane share below the block align
+quantum zeroes the chunk in the aligned split before the allocator is
+reached: doomed lane candidates must not fan the token budget out below
+the quantum, or no chunk can ever advance.
 """
 
 import pytest
@@ -386,3 +391,89 @@ def test_busy_connector_guards_preemption_and_aging_recovers():
         "expected recovery through preemption in the preempt-capable "
         "first running pass"
     )
+
+
+def test_lane_share_below_align_quantum_cannot_starve_chunk():
+    """A fanout share below the align quantum must not zero the chunk.
+
+    In a mamba "align" deployment the align quantum is the block size
+    (64 here); a chunk whose share ends before the next block boundary is
+    floored to zero tokens by the aligned split, consumes its lane, and
+    never reaches the allocator. With more lane candidates than lanes,
+    every chunk's fanout share falls below the quantum and no prefill
+    can advance while doomed async candidates hold lanes and fail the
+    full-sequence admission gate: empty steps forever. The lane share
+    must fall back to the global step budget whenever that budget can
+    cover a full quantum.
+    """
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=131,  # 2 * 64 + 3: two full quanta per step
+        max_model_len=1024,
+        max_parallel_prefills=4,
+        num_blocks=11,
+        block_size=64,
+        enable_prefix_caching=False,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+    )
+    # The scheduler-side flag of a mamba "align" deployment (derived at
+    # construction from has_mamba_layers and mamba_cache_mode == "align").
+    scheduler.need_mamba_block_aligned_split = True
+
+    def fake_lookup(request, num_computed_tokens):
+        if request.request_id == "chunk":
+            return 0, False
+        # Whole-prompt CPU-tier hit: the async admission gate pays the
+        # full-sequence requirement (8 blocks) and must fail against
+        # free (6) minus the chunk's remaining-block reservation (4).
+        return 240, True
+
+    assert scheduler.connector is not None
+    scheduler.connector.get_num_new_matched_tokens = fake_lookup
+
+    (chunk,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["chunk"],
+        block_size=64,
+    )
+    scheduler.add_request(chunk)
+    # Advance to a block-aligned mid-prefill position with two full
+    # quanta pending (the aligned split floors every step to 128 here).
+    while chunk.num_computed_tokens < 256:
+        output = scheduler.schedule()
+        assert output.total_num_scheduled_tokens > 0
+        scheduler.update_from_output(
+            output, _partial_prefill_output(list(output.num_scheduled_tokens))
+        )
+    assert chunk.is_prefill_chunk
+
+    for req_id in ("d1", "d2"):
+        (doomed,) = create_requests(
+            num_requests=1,
+            num_tokens=512,
+            req_ids=[req_id],
+            block_size=64,
+        )
+        scheduler.add_request(doomed)
+
+    # All three candidates hold lanes (4 lanes, 3 candidates), so the
+    # chunk's fanout share is ceil(131/3) = 44 < 64: below the
+    # quantum, the aligned split would zero the chunk and consume the
+    # lane at the zero-token branch. With the share cap dropped, the
+    # chunk takes two full quanta from the step budget.
+    progressed = False
+    for _ in range(64):
+        output = scheduler.schedule()
+        if output.total_num_scheduled_tokens > 0:
+            progressed = True
+            break
+        scheduler.update_from_output(output, _empty_output())
+    assert progressed, (
+        "lane fanout shares below the align quantum zeroed the chunk: "
+        "the lane-selected chunk never reached the allocator and starved "
+        "behind the doomed async candidates"
+    )
+    assert chunk.num_computed_tokens == 384
+    for req_id in ("d1", "d2"):
+        assert scheduler.requests[req_id].status == RequestStatus.WAITING

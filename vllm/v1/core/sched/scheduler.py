@@ -1102,12 +1102,24 @@ class Scheduler(SchedulerInterface):
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
                 if request.is_prefill_chunk and prefill_interleave_step is not None:
-                    num_new_tokens = min(
-                        num_new_tokens,
-                        prefill_interleave_step.token_budget(
-                            token_budget, scheduled_prefill_req_ids
-                        ),
+                    lane_share = prefill_interleave_step.token_budget(
+                        token_budget, scheduled_prefill_req_ids
                     )
+                    # Invariant: a lane share must never fall below the
+                    # recurrent-state align quantum - the aligned split
+                    # floors a chunk ending before a block boundary to
+                    # zero tokens, consuming the lane before the
+                    # allocator is reached. When the step budget covers
+                    # a full quantum, drop the share cap so an
+                    # unrunnable lane-holder cannot tax a runnable
+                    # chunk.
+                    if (
+                        self.need_mamba_block_aligned_split
+                        and lane_share < self.cache_config.block_size
+                        and token_budget >= self.cache_config.block_size
+                    ):
+                        lane_share = num_new_tokens
+                    num_new_tokens = min(num_new_tokens, lane_share)
                 num_new_tokens = min(
                     num_new_tokens, token_budget, input_budget - draft_slots
                 )
