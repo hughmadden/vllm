@@ -15,6 +15,11 @@ from vllm.v1.request import Request, RequestStatus
 
 LocalPrefillPredicate = Callable[[Request], bool]
 AUTO_MAX_PARALLEL_PREFILLS = 4
+# Rotation window for never-scheduled lane candidates: after this many
+# consecutive candidate steps without being scheduled, a request yields
+# the lane front (ranks behind recently-scheduled requests) for an equal
+# window, so it cannot monopolize lanes at rank -1 forever.
+LANE_AGING_STEPS = 32
 
 
 def resolve_max_parallel_prefills(
@@ -126,6 +131,10 @@ class PrefillInterleaveController:
 
     def __init__(self) -> None:
         self.last_scheduled_step: dict[str, int] = {}
+        # Steps spent as a lane candidate without being scheduled. Ages a
+        # never-scheduled request's rank so it cannot hold a lane at -1
+        # forever; reset by record_scheduled / forget.
+        self.attempts: dict[str, int] = {}
 
     def begin_step(
         self,
@@ -164,7 +173,7 @@ class PrefillInterleaveController:
         requests.sort(
             key=lambda request: (
                 request.priority if respect_priority else 0,
-                self.last_scheduled_step.get(request.request_id, -1),
+                self._lane_rank(request.request_id, current_step),
                 request.arrival_time,
                 request.request_id,
             )
@@ -191,12 +200,26 @@ class PrefillInterleaveController:
             )
             requests.remove(nearest_decode)
             requests.insert(0, nearest_decode)
+        for request in requests:
+            self.attempts[request.request_id] = (
+                self.attempts.get(request.request_id, 0) + 1
+            )
         return PrefillInterleaveStep(
             requests,
             max_parallel_prefills,
             request_lookup,
             is_local_prefill,
         )
+
+    def _lane_rank(self, request_id: str, current_step: int) -> int:
+        """Lane-order rank; ages never-scheduled candidates per LANE_AGING_STEPS."""
+        scheduled = self.last_scheduled_step.get(request_id)
+        if scheduled is not None:
+            return scheduled
+        attempts = self.attempts.get(request_id, 0)
+        if (attempts // LANE_AGING_STEPS) % 2 == 1:
+            return current_step
+        return -1
 
     def record_scheduled(
         self,
@@ -205,6 +228,8 @@ class PrefillInterleaveController:
     ) -> None:
         for request_id in request_ids:
             self.last_scheduled_step[request_id] = current_step
+            self.attempts.pop(request_id, None)
 
     def forget(self, request_id: str) -> None:
         self.last_scheduled_step.pop(request_id, None)
+        self.attempts.pop(request_id, None)

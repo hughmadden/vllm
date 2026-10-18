@@ -1626,11 +1626,13 @@ class Scheduler(SchedulerInterface):
                 has_local_prefill = (
                     not load_kv_async and num_computed_tokens < request.num_tokens - 1
                 )
-                interleaved_local_prefill = (
+                # Latch the lane selection before the release below can drop
+                # this request from selected_ids.
+                lane_selected = (
                     prefill_interleave_step is not None
                     and prefill_interleave_step.is_selected(request_id)
-                    and has_local_prefill
                 )
+                interleaved_local_prefill = lane_selected and has_local_prefill
                 if prefill_interleave_step is not None and not has_local_prefill:
                     prefill_interleave_step.release(request_id)
                 if load_kv_async:
@@ -1823,20 +1825,26 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    if not interleaved_local_prefill:
-                        # FCFS stops here; imports that already own their
-                        # capacity cannot take it from this request.
-                        if ready_imports is None:
-                            ready_imports = self._ready_imports_to_consider(
-                                considered_ids, prefill_interleave_step
-                            )
-                        if not ready_imports:
-                            break
+                    if lane_selected:
+                        # Invariant: a lane-holder that cannot allocate must
+                        # leave the waiting loop without holding a lane:
+                        # park it and release the lane so _replenish rotates
+                        # lanes toward the running chunks and the remaining
+                        # lane-holders get processed instead of stranded by
+                        # the FCFS stop.
+                        request_queue.remove_request(request)
+                        assert prefill_interleave_step is not None
+                        prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
                         continue
-                    request_queue.remove_request(request)
-                    assert prefill_interleave_step is not None
-                    prefill_interleave_step.mark_unavailable(request_id)
-                    step_skipped_waiting.prepend_request(request)
+                    # FCFS stops here; imports that already own their
+                    # capacity cannot take it from this request.
+                    if ready_imports is None:
+                        ready_imports = self._ready_imports_to_consider(
+                            considered_ids, prefill_interleave_step
+                        )
+                    if not ready_imports:
+                        break
                     continue
 
                 # KVTransfer: the connector uses this info to determine
