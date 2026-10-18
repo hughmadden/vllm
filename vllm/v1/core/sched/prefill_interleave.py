@@ -15,10 +15,13 @@ from vllm.v1.request import Request, RequestStatus
 
 LocalPrefillPredicate = Callable[[Request], bool]
 AUTO_MAX_PARALLEL_PREFILLS = 4
-# Rotation window for never-scheduled lane candidates: after this many
-# consecutive candidate steps without being scheduled, a request yields
-# the lane front (ranks behind recently-scheduled requests) for an equal
-# window, so it cannot monopolize lanes at rank -1 forever.
+# Staleness window for lane candidates. A never-scheduled request
+# alternates between the lane front and back after this many
+# consecutive candidate steps without being scheduled, for an equal
+# window; a candidate whose last scheduling is more than this many
+# steps behind the current step ranks stale, behind every recently
+# scheduled candidate, so neither cohort can hold lanes at a frozen
+# rank forever.
 LANE_AGING_STEPS = 32
 
 
@@ -212,9 +215,11 @@ class PrefillInterleaveController:
         )
 
     def _lane_rank(self, request_id: str, current_step: int) -> int:
-        """Lane-order rank; ages never-scheduled candidates per LANE_AGING_STEPS."""
+        """Lane-order rank; ages stale lane candidates (see LANE_AGING_STEPS)."""
         scheduled = self.last_scheduled_step.get(request_id)
         if scheduled is not None:
+            if current_step - scheduled > LANE_AGING_STEPS:
+                return current_step
             return scheduled
         attempts = self.attempts.get(request_id, 0)
         if (attempts // LANE_AGING_STEPS) % 2 == 1:

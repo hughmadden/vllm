@@ -1993,7 +1993,21 @@ class Scheduler(SchedulerInterface):
             and not defer_prefills
             and token_budget > 0
         ):
-            schedule_running_requests("prefill", allow_preemption=False)
+            # A request preempted after being scheduled keeps its lane
+            # rank, so a waiting pair can own the lanes at step start
+            # and leave this as the only pass a running chunk reaches.
+            # On a step that scheduled nothing, forbidding preemption
+            # here locks the engine into empty steps at free == 0.
+            # Preempting a request with an in-flight connector job
+            # would flush into an unbounded worker-side wait(), so
+            # allow it only while has_pending_push_work() is False:
+            # no connector transfer jobs and no tier-manager pending
+            # work. Lane aging is the recovery path meanwhile.
+            allow_preemption = not num_scheduled_tokens and (
+                self.connector is None
+                or not self.connector.has_pending_push_work()
+            )
+            schedule_running_requests("prefill", allow_preemption=allow_preemption)
 
         # The coarse runnable check can race async-completion guards. If a
         # selected decode turn produced no work, give an already-running
