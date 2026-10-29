@@ -14,7 +14,16 @@ from vllm.v1.core.sched.request_queue import RequestQueue
 from vllm.v1.request import Request, RequestStatus
 
 LocalPrefillPredicate = Callable[[Request], bool]
+RemainingWorkEstimate = Callable[[Request], int]
 AUTO_MAX_PARALLEL_PREFILLS = 4
+# Waiting states that cannot use a prefill lane this step (a remote KV load,
+# a grammar or a streaming input in progress). A request preempted mid-prefill
+# keeps is_prefill_chunk, so without this it could hold a lane while blocked.
+BLOCKED_LANE_STATUSES = (
+    RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+    RequestStatus.WAITING_FOR_REMOTE_KVS,
+    RequestStatus.WAITING_FOR_STREAMING_REQ,
+)
 # Staleness window for lane candidates. A never-scheduled request
 # alternates between the lane front and back after this many
 # consecutive candidate steps without being scheduled, for an equal
@@ -52,10 +61,18 @@ class PrefillInterleaveStep:
     max_parallel_prefills: int
     request_lookup: dict[str, Request]
     is_local_prefill: LocalPrefillPredicate
+    # Size classes (QoS): None keeps plain rank-order lanes.
+    is_long: LocalPrefillPredicate | None = None
+    max_long_prefills: int = 0
+    # False while max_long_prefills long prefills are already in flight: a
+    # looked-up long request still waiting would only be parked again, so it
+    # gets no lane (and no repeated cache lookup) until a long slot frees.
+    long_admission_open: bool = True
     rank: dict[str, int] = field(init=False)
     selected_ids: set[str] = field(default_factory=set, init=False)
     unavailable_ids: set[str] = field(default_factory=set, init=False)
     _next_candidate: int = field(default=0, init=False)
+    _consumed_ids: set[str] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
         self.rank = {
@@ -114,6 +131,9 @@ class PrefillInterleaveStep:
         return queue, request
 
     def _replenish(self) -> None:
+        if self.is_long is not None:
+            self._replenish_classed()
+            return
         while len(
             self.selected_ids
         ) < self.max_parallel_prefills and self._next_candidate < len(
@@ -127,6 +147,61 @@ class PrefillInterleaveStep:
             if current_request is None or not self.is_local_prefill(current_request):
                 continue
             self.selected_ids.add(request.request_id)
+
+    def _is_long_id(self, request_id: str) -> bool:
+        assert self.is_long is not None
+        request = self.request_lookup.get(request_id)
+        return request is not None and self.is_long(request)
+
+    def _replenish_classed(self) -> None:
+        """Fill lanes by size class, in rank order within each class.
+
+        1. Long prefills first, up to max_long_prefills: a progress floor for
+           long work, and a cap on how many lanes it holds.
+        2. Short prefills take the remaining lanes.
+        3. More long prefills only when no short candidate is left, so a lane
+           is never idle while work is runnable.
+        """
+        while len(self.selected_ids) < self.max_parallel_prefills:
+            long_selected = sum(
+                self._is_long_id(request_id) for request_id in self.selected_ids
+            )
+            first_long: str | None = None
+            first_short: str | None = None
+            for request in self.ordered_requests:
+                request_id = request.request_id
+                if (
+                    request_id in self._consumed_ids
+                    or request_id in self.unavailable_ids
+                ):
+                    continue
+                current_request = self.request_lookup.get(request_id)
+                if current_request is None or not self.is_local_prefill(
+                    current_request
+                ):
+                    continue
+                if self._is_long_id(request_id):
+                    if (
+                        not self.long_admission_open
+                        and current_request.status != RequestStatus.RUNNING
+                    ):
+                        continue
+                    if first_long is None:
+                        first_long = request_id
+                elif first_short is None:
+                    first_short = request_id
+                if first_long is not None and first_short is not None:
+                    break
+            if first_long is not None and long_selected < self.max_long_prefills:
+                pick = first_long
+            elif first_short is not None:
+                pick = first_short
+            else:
+                pick = first_long
+            if pick is None:
+                return
+            self.selected_ids.add(pick)
+            self._consumed_ids.add(pick)
 
 
 class PrefillInterleaveController:
@@ -153,6 +228,10 @@ class PrefillInterleaveController:
         decode_refill_target: int,
         current_step: int,
         respect_priority: bool,
+        is_long: LocalPrefillPredicate | None = None,
+        max_long_prefills: int = 0,
+        remaining_estimate: RemainingWorkEstimate | None = None,
+        long_admission_open: bool = True,
     ) -> PrefillInterleaveStep | None:
         """Create fair step-local prefill lanes, or use legacy scheduling."""
         if max_parallel_prefills <= 1:
@@ -164,6 +243,8 @@ class PrefillInterleaveController:
             if request.request_id in seen_request_ids:
                 continue
             if not is_local_prefill(request):
+                continue
+            if request.status in BLOCKED_LANE_STATUSES:
                 continue
             if (
                 request.status == RequestStatus.RUNNING
@@ -193,7 +274,9 @@ class PrefillInterleaveController:
             nearest_decode = min(
                 eligible,
                 key=lambda request: (
-                    max(
+                    remaining_estimate(request)
+                    if remaining_estimate is not None
+                    else max(
                         request.num_tokens - 1 - request.num_computed_tokens,
                         0,
                     ),
@@ -212,6 +295,9 @@ class PrefillInterleaveController:
             max_parallel_prefills,
             request_lookup,
             is_local_prefill,
+            is_long=is_long,
+            max_long_prefills=max_long_prefills,
+            long_admission_open=long_admission_open,
         )
 
     def _lane_rank(self, request_id: str, current_step: int) -> int:

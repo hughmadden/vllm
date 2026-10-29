@@ -414,6 +414,31 @@ class Scheduler(SchedulerInterface):
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
+        # Size-classed prefill lanes (QoS). Long prefills keep a floor of one
+        # lane and at most max_long_prefills lanes; short work always keeps at
+        # least one lane, so the cap is below the lane count.
+        self.prefill_long_threshold = self.scheduler_config.prefill_long_threshold
+        self.max_long_prefills = 0
+        if self.prefill_long_threshold > 0:
+            if self.max_parallel_prefills <= 1:
+                logger.warning(
+                    "prefill_long_threshold needs more than one prefill lane; "
+                    "max_parallel_prefills resolved to %d, so size classes are off.",
+                    self.max_parallel_prefills,
+                )
+                self.prefill_long_threshold = 0
+            else:
+                self.max_long_prefills = min(
+                    self.scheduler_config.max_long_prefills,
+                    self.max_parallel_prefills - 1,
+                )
+                logger.info(
+                    "Size-classed prefill lanes: long >= %d uncached tokens, "
+                    "%d of %d lanes for long work while short work waits.",
+                    self.prefill_long_threshold,
+                    self.max_long_prefills,
+                    self.max_parallel_prefills,
+                )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -709,6 +734,50 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _qos_remaining_tokens(self, request: Request) -> int | None:
+        """Uncached local prefill work a request still needs.
+
+        A waiting request's estimate includes the cache hits its last lookup
+        found. None means a waiting request has not been looked up yet: it
+        ranks and classes as short, and its first lookup corrects that.
+        """
+        computed = request.num_computed_tokens
+        if (
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and not request.is_prefill_chunk
+        ):
+            hint = request.qos_cached_tokens_hint
+            if hint is None:
+                return None
+            computed = max(computed, hint)
+        return max(request.num_tokens - 1 - computed, 0)
+
+    def _qos_is_long(self, request: Request) -> bool:
+        remaining = self._qos_remaining_tokens(request)
+        return remaining is not None and remaining >= self.prefill_long_threshold
+
+    def _qos_rank_remaining(self, request: Request) -> int:
+        remaining = self._qos_remaining_tokens(request)
+        return 0 if remaining is None else remaining
+
+    def _qos_num_long_in_flight(self) -> int:
+        """Long prefills already admitted: running chunks with long remaining
+        work, and remote KV loads that will need long local work after."""
+        threshold = self.prefill_long_threshold
+        count = sum(
+            request.num_tokens - 1 - request.num_computed_tokens >= threshold
+            for request in self.running
+        )
+        for request in self.skipped_waiting:
+            if (
+                request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                and request.qos_cached_tokens_hint is not None
+                and request.num_tokens - 1 - request.qos_cached_tokens_hint
+                >= threshold
+            ):
+                count += 1
+        return count
+
     @staticmethod
     def _request_has_local_prefill(request: Request) -> bool:
         """Whether a request still needs model compute for its input."""
@@ -944,6 +1013,15 @@ class Scheduler(SchedulerInterface):
                 decode_refill_target=self.decode_refill_target,
                 current_step=self.current_step,
                 respect_priority=self.policy == SchedulingPolicy.PRIORITY,
+                is_long=self._qos_is_long if self.prefill_long_threshold else None,
+                max_long_prefills=self.max_long_prefills,
+                remaining_estimate=(
+                    self._qos_rank_remaining if self.prefill_long_threshold else None
+                ),
+                long_admission_open=(
+                    not self.prefill_long_threshold
+                    or self._qos_num_long_in_flight() < self.max_long_prefills
+                ),
             )
             if self.max_parallel_prefills > 1 and has_possible_prefill
             else None
@@ -1420,6 +1498,8 @@ class Scheduler(SchedulerInterface):
                             request_id,
                         )
                     request_queue.remove_request(request)
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request_id)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1631,6 +1711,26 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                qos_long_admission = False
+                if self.prefill_long_threshold > 0:
+                    request.qos_cached_tokens_hint = num_computed_tokens
+                    qos_long_admission = (
+                        prefill_interleave_step is not None
+                        and request.num_tokens - 1 - num_computed_tokens
+                        >= self.prefill_long_threshold
+                    )
+                    if (
+                        qos_long_admission
+                        and self._qos_num_long_in_flight() >= self.max_long_prefills
+                    ):
+                        # Skip over: this long prompt waits for the long work
+                        # in flight, without blocking the short work behind it.
+                        assert prefill_interleave_step is not None
+                        request_queue.remove_request(request)
+                        prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input: list[int] = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1815,6 +1915,13 @@ class Scheduler(SchedulerInterface):
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
+                full_sequence_reserved_blocks = 0
+                if qos_long_admission and self.scheduler_reserve_full_isl:
+                    # Size classes admit more prefills at once; a long prompt
+                    # must fit beside what in-flight prefills still need.
+                    full_sequence_reserved_blocks = (
+                        reserved_blocks or self._inflight_prefill_reserved_blocks()
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1828,6 +1935,7 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    full_sequence_reserved_blocks=full_sequence_reserved_blocks,
                 )
 
                 if new_blocks is None:
@@ -2346,6 +2454,11 @@ class Scheduler(SchedulerInterface):
             "decode_refill_target": self.scheduler_config.decode_refill_target,
             "effective_decode_refill_target": self.decode_refill_target,
             "runnable_decodes": num_runnable_decodes,
+            "prefill_long_threshold": self.prefill_long_threshold,
+            "effective_max_long_prefills": self.max_long_prefills,
+            "long_prefills_in_flight": (
+                self._qos_num_long_in_flight() if self.prefill_long_threshold else 0
+            ),
         }
 
     def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
